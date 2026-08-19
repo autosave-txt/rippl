@@ -1,0 +1,12 @@
+db.sqlite
+db.sqlite.backup
+db.sqlite.bak
+*.sqlite
+*.sqlite3
+app.py.backup
+index.html.bak
+.env
+.env.local
+__pycache__/
+*.pyc
+img
