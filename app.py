@@ -629,6 +629,23 @@ def _raw_extract(video_id):
 import re as _re
 _VALID_ID = _re.compile(r'^[A-Za-z0-9_-]{11}$')
 
+
+def _url_works(url, timeout=6.0):
+    """Quick Range probe from this host. Returns True if Google accepts the URL."""
+    if not url:
+        return False
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Referer": "https://www.youtube.com/",
+        "Range": "bytes=0-1023",
+    }
+    try:
+        with httpx.Client(follow_redirects=True, timeout=timeout) as c:
+            r = c.get(url, headers=headers)
+            return r.status_code in (200, 206)
+    except Exception:
+        return False
+
 @app.get("/video/{video_id}")
 def get_video(video_id: str, quality: str = Query("best"), nohls: int = Query(0), nosplit: int = Query(0), fresh: int = Query(0)):
     # Reject malformed IDs immediately. A bad id (e.g. "#", truncated) otherwise sends
@@ -707,45 +724,71 @@ def get_video(video_id: str, quality: str = Query("best"), nohls: int = Query(0)
     audio_url = None
     is_split = False
 
+    def pick_progressive(maxh=None):
+        # Try several progressive candidates until one actually works from this IP
+        cand = [f for f in formats
+                if f.get("vcodec", "none") != "none" and f.get("acodec", "none") != "none"
+                and f.get("url") and "m3u8" not in (f.get("protocol") or "")
+                and (maxh is None or (f.get("height") or 0) <= maxh)]
+        cand.sort(key=lambda f: (f.get("height") or 0, f.get("tbr") or 0), reverse=True)
+        for f in cand[:8]:
+            u = f.get("url")
+            if _url_works(u):
+                return u
+        return None
+
+    def pick_video_only(h):
+        cand = [f for f in formats
+                if f.get("vcodec", "none") != "none" and f.get("acodec", "none") == "none"
+                and f.get("url") and "m3u8" not in (f.get("protocol") or "")
+                and (h is None or (f.get("height") or 0) == h)]
+        cand.sort(key=lambda f: (f.get("ext") == "mp4", f.get("tbr") or 0), reverse=True)
+        for f in cand[:6]:
+            u = f.get("url")
+            if _url_works(u):
+                return u
+        return None
+
+    def pick_audio():
+        cand = [f for f in formats
+                if f.get("acodec", "none") != "none" and f.get("vcodec", "none") == "none"
+                and f.get("url") and "m3u8" not in (f.get("protocol") or "")]
+        cand.sort(key=lambda f: (f.get("ext") in ("m4a", "mp4"), f.get("abr") or 0), reverse=True)
+        for f in cand[:6]:
+            u = f.get("url")
+            if _url_works(u):
+                return u
+        return None
+
     if single_element:
-        # Explicit single-element request (frontend recovery path). Prefer progressive.
-        # Progressive formats are currently frequently 403 from this host IP, so also
-        # accept a video-only stream here as last resort (audio will be missing, but
-        # better than total failure).
+        video_url = pick_progressive(target_h) or pick_progressive()
+        if not video_url and info.get("url"):
+            video_url = info.get("url")
+    else:
+        # Prefer split (high quality). Probe so we don't hand the browser a 403 URL.
+        vo = pick_video_only(target_h) if target_h else None
+        if not vo and target_h and heights:
+            for h in sorted(heights, key=lambda x: abs(x - target_h)):
+                vo = pick_video_only(h)
+                if vo:
+                    break
+        au = pick_audio()
+        if vo and au:
+            video_url = vo
+            audio_url = au
+            is_split = True
+        else:
+            video_url = pick_progressive(target_h) or pick_progressive()
+            if not video_url and info.get("url"):
+                video_url = info.get("url")
+
+    if not video_url:
+        # last ditch: unprobed progressive (better than total failure)
         p = best_progressive(target_h) or best_progressive()
         if p:
             video_url = p.get("url")
-        else:
-            vo = best_video_only(target_h) if target_h else None
-            if not vo and heights:
-                vo = best_video_only(heights[0])
-            if vo:
-                video_url = vo.get("url")
-            elif info.get("url"):
-                video_url = info.get("url")
-    else:
-        # NORMAL PLAYBACK: always prefer split (video-only + audio) when both exist.
-        # On this server's IP, progressive/muxed googlevideo URLs frequently return 403
-        # while the adaptive (DASH) tracks succeed. Preferring split makes playback
-        # reliable without lowering quality.
-        vo = best_video_only(target_h) if target_h else None
-        if not vo and target_h and heights:
-            # closest available height
-            closest = min(heights, key=lambda h: abs(h - target_h))
-            vo = best_video_only(closest)
-        au = best_audio()
-        if vo and au:
-            video_url = vo.get("url")
-            audio_url = au.get("url")
-            is_split = True
-        else:
-            # No split pair available — fall back to progressive / any url
-            p = best_progressive(target_h) or best_progressive()
-            if p:
-                video_url = p.get("url")
-            elif info.get("url"):
-                video_url = info.get("url")
-
+            audio_url = None
+            is_split = False
     if not video_url:
         raise HTTPException(status_code=404, detail="No playable stream found")
 
@@ -975,9 +1018,12 @@ def download(video_id: str = Query(...), kind: str = Query("video")):
 @app.get("/proxy")
 async def proxy_stream(url: str = Query(...), request: Request = None):
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Referer": "https://www.youtube.com/",
         "Origin": "https://www.youtube.com",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
     }
     range_header = request.headers.get("range") if request else None
     if range_header:
