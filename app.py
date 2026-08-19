@@ -576,22 +576,39 @@ def _raw_extract(video_id):
     """Extract full info once (all formats) and cache it. This is the expensive call;
     caching it makes quality switches and repeat opens instant.
 
-    This is the PROVEN-WORKING extraction (the one that delivered 1080p/4K + slowed):
-      • extract_info with NORMAL processing (NOT process=False). Normal processing is what
-        descrambles YouTube's signature/`n` parameter, giving URLs that actually play.
-        process=False returns raw URLs that load to a BLACK screen — that was the bug.
-      • Client order [None, "web", "ios", "android", "tv"] — leading with None lets yt-dlp
-        use its own (well-tuned) default client selection, which avoids the SABR/DRM trap
-        that forcing a single old client name falls into. web/mweb expose the full DASH
-        ladder (1080/1440/2160); android is a reliable progressive fallback.
-      • Accept the first client that returns ANY non-empty formats list."""
+    Tries several player clients and keeps the result with the richest format ladder
+    (most heights / any video-only tracks). web/mweb expose full DASH (1080+);
+    android often only returns a single progressive 360p — accepting the first
+    non-empty list was capping quality at 360p.
+    """
     cache_key = f"info::{video_id}"
     cached = cache_get(cache_key)
     if cached:
         return cached
     url = f"https://www.youtube.com/watch?v={video_id}"
     last_err = None
-    for client in ["android", "ios", "web", "mweb", None, "tv"]:
+    best_info = None
+    best_score = -1
+
+    def score(info):
+        fmts = info.get("formats") or []
+        heights = set()
+        has_video_only = False
+        has_audio_only = False
+        for f in fmts:
+            h = f.get("height") or 0
+            if h:
+                heights.add(h)
+            vc = f.get("vcodec") or "none"
+            ac = f.get("acodec") or "none"
+            if vc != "none" and ac == "none":
+                has_video_only = True
+            if ac != "none" and vc == "none":
+                has_audio_only = True
+        # Prefer full DASH ladder (split) and higher max height
+        return (1 if (has_video_only and has_audio_only) else 0, max(heights) if heights else 0, len(heights), len(fmts))
+
+    for client in [None, "web", "mweb", "ios", "android", "tv"]:
         opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True}
         if client:
             opts["extractor_args"] = {"youtube": {"player_client": [client]}}
@@ -599,11 +616,20 @@ def _raw_extract(video_id):
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
             if info and info.get("formats"):
-                cache_set(cache_key, info, 900)  # 15 min — stream URLs expire; shorter cache reduces 403s
-                return info
+                s = score(info)
+                if s > best_score:
+                    best_score = s
+                    best_info = info
+                # Early exit if we already have a solid DASH ladder with 720p+
+                if s[0] == 1 and s[1] >= 720:
+                    break
         except Exception as e:
             last_err = e
             continue
+
+    if best_info:
+        cache_set(cache_key, best_info, 900)
+        return best_info
     raise last_err if last_err else Exception("extraction failed")
 
 
