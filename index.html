@@ -2951,7 +2951,7 @@ function startPreview(card) {
   previewCardEl = card;
   previewTimer = setTimeout(async () => {
     try {
-      const res = await fetch(`/video/${id}?quality=360`);
+      const res = await fetch(`/video/${id}?quality=best`);
       if (!res.ok) return;
       const data = await res.json();
       if (!data.video_url) return;
@@ -2959,7 +2959,7 @@ function startPreview(card) {
       const vid = document.createElement('video');
       vid.className = 'card-preview-video';
       vid.muted = true; vid.loop = true; vid.playsInline = true;
-      vid.src = data.video_url;   // already an absolute, proxied URL from the server
+      vid.src = data.video_url;   // proxied; for split streams this is video-only (fine for muted preview)
       const imgParent = card.querySelector('img') ? card.querySelector('img').parentElement : card;
       imgParent.appendChild(vid);
       previewVideoEl = vid;
@@ -3268,16 +3268,19 @@ function syncAudio() { _syncAudioToVideo(true); }
 // If the chosen stream fails to load, ask the backend to fall back to a single muxed
 // (progressive) stream, preserving the playback position.
 function refetchProgressive() {
+  // Recovery path. Progressive formats frequently 403 from this host; request a
+  // fresh best-quality extract (split preferred by backend) and use the normal
+  // setupPlayback path so both video and audio tracks load correctly.
   if (!state.currentVideo) { setPlayerStatus('this vid is NOT going to load <3', true, true); return; }
   const t = player.currentTime || 0;
   const wasPaused = player.paused;
   setPlayerStatus('LOADING', true);
-  fetch(`/video/${state.currentVideo.id}?quality=360&nohls=1`).then(r=>r.json()).then(data => {
-    if (!data.video_url) { setPlayerStatus('this vid is NOT going to load <3', true, true); return; }
-    unbindSplitSync(); stopSplitAudio();
-    state.isSplit = false;
-    player.muted = false;
-    player.src = data.video_url; player.load();
+  const q = (state.currentQuality && state.currentQuality !== 'auto') ? state.currentQuality : 'best';
+  fetch(`/video/${state.currentVideo.id}?quality=${encodeURIComponent(q)}&fresh=1`).then(r=>r.json()).then(data => {
+    if (!data || !data.video_url) { setPlayerStatus('this vid is NOT going to load <3', true, true); return; }
+    state._proxyUrl = data.video_url;
+    state._directUrl = data.video_url_direct || data.video_url;
+    setupPlayback(data);
     player.addEventListener('loadedmetadata', () => {
       try { player.currentTime = t; } catch {}
       applyPlaybackRate();

@@ -591,7 +591,7 @@ def _raw_extract(video_id):
         return cached
     url = f"https://www.youtube.com/watch?v={video_id}"
     last_err = None
-    for client in [None, "web", "ios", "android", "tv"]:
+    for client in ["android", "ios", "web", "mweb", None, "tv"]:
         opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True}
         if client:
             opts["extractor_args"] = {"youtube": {"player_client": [client]}}
@@ -599,7 +599,7 @@ def _raw_extract(video_id):
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
             if info and info.get("formats"):
-                cache_set(cache_key, info, 1800)  # 30 min — stream URLs stay valid a few hours
+                cache_set(cache_key, info, 900)  # 15 min — stream URLs expire; shorter cache reduces 403s
                 return info
         except Exception as e:
             last_err = e
@@ -689,34 +689,43 @@ def get_video(video_id: str, quality: str = Query("best"), nohls: int = Query(0)
     is_split = False
 
     if single_element:
-        # Fallback path: progressive (muxed) only — single <video>, audio included.
+        # Explicit single-element request (frontend recovery path). Prefer progressive.
+        # Progressive formats are currently frequently 403 from this host IP, so also
+        # accept a video-only stream here as last resort (audio will be missing, but
+        # better than total failure).
         p = best_progressive(target_h) or best_progressive()
         if p:
             video_url = p.get("url")
-        elif info.get("url"):
-            video_url = info.get("url")
-    else:
-        # If the target height is available as a progressive (muxed) stream, use it (simplest).
-        prog = best_progressive(target_h)
-        if prog and (prog.get("height") or 0) == target_h:
-            video_url = prog.get("url")
         else:
-            # Otherwise use a video-only stream at the target height + a separate audio
-            # stream. The frontend plays them in two synced elements — this is what unlocks
-            # 720/1080/1440/2160 that YouTube only serves as separate (DASH) tracks.
             vo = best_video_only(target_h) if target_h else None
-            au = best_audio()
-            if vo and au:
+            if not vo and heights:
+                vo = best_video_only(heights[0])
+            if vo:
                 video_url = vo.get("url")
-                audio_url = au.get("url")
-                is_split = True
-            else:
-                # fall back to best progressive available
-                p = best_progressive()
-                if p:
-                    video_url = p.get("url")
-                elif info.get("url"):
-                    video_url = info.get("url")
+            elif info.get("url"):
+                video_url = info.get("url")
+    else:
+        # NORMAL PLAYBACK: always prefer split (video-only + audio) when both exist.
+        # On this server's IP, progressive/muxed googlevideo URLs frequently return 403
+        # while the adaptive (DASH) tracks succeed. Preferring split makes playback
+        # reliable without lowering quality.
+        vo = best_video_only(target_h) if target_h else None
+        if not vo and target_h and heights:
+            # closest available height
+            closest = min(heights, key=lambda h: abs(h - target_h))
+            vo = best_video_only(closest)
+        au = best_audio()
+        if vo and au:
+            video_url = vo.get("url")
+            audio_url = au.get("url")
+            is_split = True
+        else:
+            # No split pair available — fall back to progressive / any url
+            p = best_progressive(target_h) or best_progressive()
+            if p:
+                video_url = p.get("url")
+            elif info.get("url"):
+                video_url = info.get("url")
 
     if not video_url:
         raise HTTPException(status_code=404, detail="No playable stream found")
@@ -747,7 +756,7 @@ def get_video(video_id: str, quality: str = Query("best"), nohls: int = Query(0)
         "tags": (info.get("tags") or [])[:15],
         "categories": info.get("categories") or [],
     }
-    cache_set(resp_key, result, 1500)
+    cache_set(resp_key, result, 600)
     return result
 
 
