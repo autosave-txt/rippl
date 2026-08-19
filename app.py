@@ -573,78 +573,45 @@ def playlist_videos(playlist_id: str = Query(...)):
 # ── Video (with quality selection) ───────────────────────────────────────────
 
 def _raw_extract(video_id):
-    """Extract full info once and cache it.
+    """Extract full info once (all formats) and cache it. This is the expensive call;
+    caching it makes quality switches and repeat opens instant.
 
-    Prefer web for the full DASH ladder (720/1080+). Fall back quickly.
-    Sequential multi-client extracts are too slow on a phone.
-    """
+    This is the PROVEN-WORKING extraction (the one that delivered 1080p/4K + slowed):
+      • extract_info with NORMAL processing (NOT process=False). Normal processing is what
+        descrambles YouTube's signature/`n` parameter, giving URLs that actually play.
+        process=False returns raw URLs that load to a BLACK screen — that was the bug.
+      • Client order [None, "web", "ios", "android", "tv"] — leading with None lets yt-dlp
+        use its own (well-tuned) default client selection, which avoids the SABR/DRM trap
+        that forcing a single old client name falls into. web/mweb expose the full DASH
+        ladder (1080/1440/2160); android is a reliable progressive fallback.
+      • Accept the first client that returns ANY non-empty formats list."""
     cache_key = f"info::{video_id}"
     cached = cache_get(cache_key)
     if cached:
         return cached
     url = f"https://www.youtube.com/watch?v={video_id}"
     last_err = None
-    best_info = None
-    best_h = 0
-
-    def try_client(client):
-        opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-            "noplaylist": True,
-            "socket_timeout": 15,
-        }
+    for client in ["android", None, "web", "ios", "tv"]:
+        opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True}
         if client:
             opts["extractor_args"] = {"youtube": {"player_client": [client]}}
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=False)
-
-    def max_height(info):
-        if not info or not info.get("formats"):
-            return 0
-        hs = [f.get("height") or 0 for f in info["formats"] if (f.get("vcodec") or "none") != "none"]
-        return max(hs) if hs else 0
-
-    for client in [None, "web", "mweb", "android"]:
         try:
-            info = try_client(client)
-            h = max_height(info)
-            if h > best_h:
-                best_h = h
-                best_info = info
-            if h >= 720:
-                break
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            if info and info.get("formats"):
+                cache_set(cache_key, info, 1800)  # 30 min — stream URLs stay valid a few hours
+                return info
         except Exception as e:
             last_err = e
             continue
-
-    if best_info:
-        cache_set(cache_key, best_info, 900)
-        return best_info
     raise last_err if last_err else Exception("extraction failed")
+
 
 
 
 import re as _re
 _VALID_ID = _re.compile(r'^[A-Za-z0-9_-]{11}$')
 
-
-def _url_works(url, timeout=6.0):
-    """Quick Range probe from this host. Returns True if Google accepts the URL."""
-    if not url:
-        return False
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Referer": "https://www.youtube.com/",
-        "Range": "bytes=0-1023",
-    }
-    try:
-        with httpx.Client(follow_redirects=True, timeout=timeout) as c:
-            r = c.get(url, headers=headers)
-            return r.status_code in (200, 206)
-    except Exception:
-        return False
 
 @app.get("/video/{video_id}")
 def get_video(video_id: str, quality: str = Query("best"), nohls: int = Query(0), nosplit: int = Query(0), fresh: int = Query(0)):
@@ -724,71 +691,32 @@ def get_video(video_id: str, quality: str = Query("best"), nohls: int = Query(0)
     audio_url = None
     is_split = False
 
-    def pick_progressive(maxh=None):
-        # Try several progressive candidates until one actually works from this IP
-        cand = [f for f in formats
-                if f.get("vcodec", "none") != "none" and f.get("acodec", "none") != "none"
-                and f.get("url") and "m3u8" not in (f.get("protocol") or "")
-                and (maxh is None or (f.get("height") or 0) <= maxh)]
-        cand.sort(key=lambda f: (f.get("height") or 0, f.get("tbr") or 0), reverse=True)
-        for f in cand[:8]:
-            u = f.get("url")
-            if _url_works(u):
-                return u
-        return None
-
-    def pick_video_only(h):
-        cand = [f for f in formats
-                if f.get("vcodec", "none") != "none" and f.get("acodec", "none") == "none"
-                and f.get("url") and "m3u8" not in (f.get("protocol") or "")
-                and (h is None or (f.get("height") or 0) == h)]
-        cand.sort(key=lambda f: (f.get("ext") == "mp4", f.get("tbr") or 0), reverse=True)
-        for f in cand[:6]:
-            u = f.get("url")
-            if _url_works(u):
-                return u
-        return None
-
-    def pick_audio():
-        cand = [f for f in formats
-                if f.get("acodec", "none") != "none" and f.get("vcodec", "none") == "none"
-                and f.get("url") and "m3u8" not in (f.get("protocol") or "")]
-        cand.sort(key=lambda f: (f.get("ext") in ("m4a", "mp4"), f.get("abr") or 0), reverse=True)
-        for f in cand[:6]:
-            u = f.get("url")
-            if _url_works(u):
-                return u
-        return None
-
+    # RELIABILITY FIRST (blocked residential IPs):
+    # Progressive/muxed streams (especially android 360p) often work when DASH
+    # 720/1080 tracks return 403. Prefer progressive for normal playback so
+    # videos actually play. Split is only used when no progressive exists.
     if single_element:
-        video_url = pick_progressive(target_h) or pick_progressive()
-        if not video_url and info.get("url"):
-            video_url = info.get("url")
-    else:
-        # Prefer split (high quality). Probe so we don't hand the browser a 403 URL.
-        vo = pick_video_only(target_h) if target_h else None
-        if not vo and target_h and heights:
-            for h in sorted(heights, key=lambda x: abs(x - target_h)):
-                vo = pick_video_only(h)
-                if vo:
-                    break
-        au = pick_audio()
-        if vo and au:
-            video_url = vo
-            audio_url = au
-            is_split = True
-        else:
-            video_url = pick_progressive(target_h) or pick_progressive()
-            if not video_url and info.get("url"):
-                video_url = info.get("url")
-
-    if not video_url:
-        # last ditch: unprobed progressive (better than total failure)
         p = best_progressive(target_h) or best_progressive()
         if p:
             video_url = p.get("url")
-            audio_url = None
-            is_split = False
+        elif info.get("url"):
+            video_url = info.get("url")
+    else:
+        p = best_progressive(target_h) or best_progressive()
+        if p:
+            video_url = p.get("url")
+        else:
+            vo = best_video_only(target_h) if target_h else None
+            if not vo and heights:
+                vo = best_video_only(heights[0])
+            au = best_audio()
+            if vo and au:
+                video_url = vo.get("url")
+                audio_url = au.get("url")
+                is_split = True
+            elif info.get("url"):
+                video_url = info.get("url")
+
     if not video_url:
         raise HTTPException(status_code=404, detail="No playable stream found")
 
@@ -818,7 +746,7 @@ def get_video(video_id: str, quality: str = Query("best"), nohls: int = Query(0)
         "tags": (info.get("tags") or [])[:15],
         "categories": info.get("categories") or [],
     }
-    cache_set(resp_key, result, 600)
+    cache_set(resp_key, result, 1500)
     return result
 
 
@@ -971,6 +899,7 @@ def download(video_id: str = Query(...), kind: str = Query("video")):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": "https://www.youtube.com/",
+        "Origin": "https://www.youtube.com",
     }
 
     # Open upstream stream the safe way: build_request + send(stream=True), and close
