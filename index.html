@@ -2988,6 +2988,7 @@ let _ignoreMediaError = false; // true while we intentionally tear down the old 
 
 async function playVideo(videoId, title, thumbnail, channel, quality) {
   // Only show player view if user triggered (not auto-next)
+  const wasAutoNext = _autoNext;
   if (!_autoNext) showView('player');
   _autoNext = false;
 
@@ -2996,6 +2997,7 @@ async function playVideo(videoId, title, thumbnail, channel, quality) {
   const myGen = _playGen;
   state._proxyTried = false;
   state._freshTried = false;
+  state._autoNextPlay = wasAutoNext; // recovery paths can auto-retry once
 
   // Track previous video for prev button
   if (state.currentVideo && state.currentVideo.id !== videoId) {
@@ -3078,7 +3080,11 @@ async function playVideo(videoId, title, thumbnail, channel, quality) {
   loadRelatedVideos(videoId);
 
   try {
-    const res = await fetch(`/video/${videoId}?quality=${quality}`);
+    // Auto-next often hits a cached response whose googlevideo URLs already expired.
+    // Request a fresh extract so the next track gets live stream URLs.
+    const freshQ = (wasAutoNext || state._forceFresh) ? '&fresh=1' : '';
+    state._forceFresh = false;
+    const res = await fetch(`/video/${videoId}?quality=${quality}${freshQ}`);
     if (!res.ok) throw new Error(`Server error ${res.status}`);
     const data = await res.json();
 
@@ -3100,6 +3106,13 @@ async function playVideo(videoId, title, thumbnail, channel, quality) {
     if (myGen !== _playGen) return; // a newer playVideo superseded this request
 
     if (!data.video_url) {
+      if (wasAutoNext && !state._autoNextRetried) {
+        state._autoNextRetried = true;
+        state._forceFresh = true;
+        setTimeout(() => playVideo(videoId, title, thumbnail, channel, quality), 400);
+        return;
+      }
+      state._autoNextRetried = false;
       setPlayerStatus("this vid is NOT going to load <3", true, true);
       loadComments(videoId, myReqId);
       return;
@@ -3113,6 +3126,7 @@ async function playVideo(videoId, title, thumbnail, channel, quality) {
     _ignoreMediaError = false;
 
     state.userPaused = false;
+    state._autoNextRetried = false;
     setPlayerStatus('', false);
     const playPromise = player.play();
     if (playPromise) playPromise.catch((err) => {
@@ -3149,6 +3163,13 @@ async function playVideo(videoId, title, thumbnail, channel, quality) {
       playVideo(videoId, title, thumbnail, channel, 'best');
       return;
     }
+    if (wasAutoNext && !state._autoNextRetried) {
+      state._autoNextRetried = true;
+      state._forceFresh = true;
+      setTimeout(() => playVideo(videoId, title, thumbnail, channel, quality || 'best'), 400);
+      return;
+    }
+    state._autoNextRetried = false;
     setPlayerStatus('this vid is NOT going to load <3', true, true);
   }
 }
@@ -4302,11 +4323,26 @@ player.addEventListener('loadedmetadata', () => {
   // Now that we know the real duration, rebuild the floating-comment timings
   floatComments._needRebuild = true;
 });
+// Warm the upcoming track ~12s before the end so auto-next gets a live stream URL.
+player.addEventListener('timeupdate', () => {
+  try {
+    if (!state.queue.length || state.isRepeat) return;
+    const dur = player.duration || 0;
+    const t = player.currentTime || 0;
+    if (!(dur > 20) || t < dur - 12) return;
+    let n = state.isShuffle ? -1 : state.queueIndex + 1;
+    if (!state.isShuffle && n >= state.queue.length) n = 0;
+    if (n < 0 || !state.queue[n]) return;
+    const nxt = state.queue[n];
+    if (!nxt.id || state._warmedId === nxt.id) return;
+    state._warmedId = nxt.id;
+    fetch('/video/' + encodeURIComponent(nxt.id) + '?quality=best&fresh=1').catch(()=>{});
+  } catch (e) {}
+});
 player.addEventListener('ended', () => {
   if (state.isRepeat) return;
   // Defer so the ended/teardown cycle finishes before we load the next track.
-  // Fixes: auto-advanced track shows "NOT going to load" but works on manual next/prev.
-  setTimeout(() => { if (!state.isRepeat) playNext(); }, 80);
+  setTimeout(() => { if (!state.isRepeat) playNext(); }, 120);
 });
 player.addEventListener('error', () => {
   // Ignore teardown / empty-src errors (common on auto-next when we clear the old track).
@@ -4315,7 +4351,15 @@ player.addEventListener('error', () => {
   if (state.isSplit || state.isHls) { refetchProgressive(); }
   else if (!state._proxyTried) tryProxyFallback();
   else if (!state._freshTried && state.currentVideo) { state._freshTried = true; refetchFresh(); }
-  else setPlayerStatus("this vid is NOT going to load <3",true,true);
+  else if (state._autoNextPlay && state.currentVideo && !state._autoNextRetried) {
+    // Last chance on auto-advance: full re-extract + play again once.
+    state._autoNextRetried = true;
+    state._forceFresh = true;
+    const v = state.currentVideo;
+    setTimeout(() => playVideo(v.id, v.title||'', v.thumbnail||'', v.channel||'', state.currentQuality||'best'), 300);
+  } else {
+    setPlayerStatus("this vid is NOT going to load <3",true,true);
+  }
 });
 player.addEventListener('waiting', () => { setPlayerStatus('BUFFERING',true,false); document.getElementById('now-playing-bar').classList.remove('playing'); });
 player.addEventListener('canplay', () => { setPlayerStatus('',false); if(!player.paused) document.getElementById('now-playing-bar').classList.add('playing'); });
