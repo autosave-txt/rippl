@@ -2986,6 +2986,54 @@ let _autoNext = false; // flag: true when triggered by player.ended, not user
 let _playGen = 0;       // bumps on every playVideo; ignores stale errors/fetches
 let _ignoreMediaError = false; // true while we intentionally tear down the old src
 
+// ── Prewarm cache for lock-screen / background auto-advance ───────────────────
+// Brave FREEZES fetch() the moment the screen locks, so the next track's stream data
+// must already be in memory before you lock — otherwise the auto-advance falls back to
+// a background fetch that stalls and you get "this vid is NOT going to load".
+// We therefore prewarm the next few tracks AS SOON AS the current one starts playing
+// (while the app is still foreground/active), and buffer several ahead. Auto-advance
+// then reuses this data as a pure media swap with zero network in the background.
+const _prewarm = {};                 // id -> { quality, data }
+const _prewarmInflight = new Set();   // ids currently being fetched (avoid duplicates)
+
+function _prewarmOne(track, quality) {
+  if (!track || !track.id) return;
+  const id = track.id;
+  if (_prewarm[id] && _prewarm[id].quality === quality) return;  // already buffered
+  if (_prewarmInflight.has(id)) return;                          // already fetching
+  _prewarmInflight.add(id);
+  // Plain (non-fresh) fetch: reuses the server's cached extraction (the reliable one),
+  // and the server's per-video lock stops any duplicate extraction.
+  fetch('/video/' + encodeURIComponent(id) + '?quality=' + encodeURIComponent(quality))
+    .then(r => r.ok ? r.json() : null)
+    .then(d => { if (d && d.video_url) _prewarm[id] = { quality, data: d }; })
+    .catch(() => {})
+    .finally(() => { _prewarmInflight.delete(id); });
+}
+
+// Prewarm the next `count` upcoming tracks (sequential order only — a shuffle "next" is
+// random and can't be known ahead). Safe to call repeatedly; it's idempotent per id.
+function prewarmAhead(count) {
+  try {
+    if (state.isShuffle || !state.queue.length) return;
+    const q = state.currentQuality || 'best';
+    let warmed = 0;
+    for (let k = 1; k <= 10 && warmed < count; k++) {
+      const idx = state.queueIndex + k;
+      if (idx >= state.queue.length) break;
+      const nxt = state.queue[idx];
+      if (nxt && nxt.id) { _prewarmOne(nxt, q); warmed++; }
+    }
+    // Keep the buffer bounded: drop anything no longer near the play position.
+    const ids = Object.keys(_prewarm);
+    if (ids.length > 12) {
+      const keep = new Set();
+      for (let k = 0; k <= 10; k++) { const t = state.queue[state.queueIndex + k]; if (t && t.id) keep.add(t.id); }
+      ids.forEach(id => { if (!keep.has(id)) delete _prewarm[id]; });
+    }
+  } catch (e) {}
+}
+
 async function playVideo(videoId, title, thumbnail, channel, quality) {
   // Only show player view if user triggered (not auto-next)
   const wasAutoNext = _autoNext;
@@ -3089,25 +3137,21 @@ async function playVideo(videoId, title, thumbnail, channel, quality) {
   loadRelatedVideos(videoId);
 
   try {
-    // Prefer the next-track data the warm step already fetched ~12s before the
-    // previous track ended. The warm step does the ONE fresh extraction for this
-    // track; reusing it here means auto-advance never re-extracts the same video a
-    // second time within seconds — that rapid double-extraction is what YouTube
-    // throttles, making the second set of URLs 403 ("this vid is NOT going to load").
+    // Prefer PREWARMED next-track data (fetched earlier, while the app was foreground).
+    // When the screen is locked Brave freezes fetch(), so the only way auto-advance can
+    // work is if the stream data is already in memory — then this is a pure media swap
+    // with no background network at all.
     let data;
-    if (wasAutoNext && state._prefetchData
-        && state._prefetchData.id === videoId
-        && state._prefetchData.quality === quality
-        && state._prefetchData.data && state._prefetchData.data.video_url) {
-      data = state._prefetchData.data;
-      state._prefetchData = null;
+    const pw = (wasAutoNext && _prewarm[videoId] && _prewarm[videoId].quality === quality
+                && _prewarm[videoId].data && _prewarm[videoId].data.video_url)
+               ? _prewarm[videoId] : null;
+    if (pw) {
+      data = pw.data;
+      delete _prewarm[videoId];
       state._forceFresh = false;
     } else {
-      // No usable prefetch (e.g. shuffle, or warm still in flight). Do a PLAIN fetch:
-      // it hits the server cache the warm step populated and reuses that single
-      // fresh extraction. Only ask for a brand-new extract when an actual playback
-      // error set _forceFresh — never automatically on auto-advance, since doing so
-      // is exactly what triggered the throttle→403 that broke gapless playback.
+      // No prewarm available (shuffle, cold start, or a genuine error retry). Fetch it.
+      // Only ask for a brand-new extract when a real playback error set _forceFresh.
       const freshQ = state._forceFresh ? '&fresh=1' : '';
       state._forceFresh = false;
       const res = await fetch(`/video/${videoId}?quality=${quality}${freshQ}`);
@@ -3182,6 +3226,13 @@ async function playVideo(videoId, title, thumbnail, channel, quality) {
     // Pre-load lyrics in the background so they open instantly (reverted per request —
     // lazy-loading made the user wait when opening the panel).
     prefetchLyrics();
+
+    // Prewarm the next few tracks NOW, while the app is foreground/active. This is what
+    // makes lock-screen auto-advance work: by the time the user locks, the upcoming
+    // tracks' stream data is already in memory, so advancing needs no background fetch
+    // (which Brave would freeze). Delayed slightly so the current track's requests win
+    // the network first. Also re-run once the autofill queue is populated (below).
+    setTimeout(() => prewarmAhead(3), 1500);
 
   } catch(e) {
     if (myGen !== _playGen) return;
@@ -3598,6 +3649,9 @@ async function loadRelatedVideos(videoId) {
     if (additions.length) {
       state.queue = state.queue.concat(additions);
       renderQueue();
+      // The queue just gained upcoming tracks — prewarm them now (foreground) so
+      // lock-screen auto-advance has their data ready with no background fetch.
+      prewarmAhead(3);
     }
   } catch {}
 }
@@ -4350,27 +4404,20 @@ player.addEventListener('loadedmetadata', () => {
   // Now that we know the real duration, rebuild the floating-comment timings
   floatComments._needRebuild = true;
 });
-// Warm the upcoming track ~12s before the end so auto-next gets a live stream URL.
+// Safety refresh: if we're near the end and the next track still isn't prewarmed (e.g.
+// the queue changed after the track started), try once more. The real prewarming happens
+// at track-start (foreground); this is only a backstop while still actively playing.
 player.addEventListener('timeupdate', () => {
   try {
-    if (!state.queue.length || state.isRepeat) return;
+    if (!state.queue.length || state.isRepeat || state.isShuffle) return;
     const dur = player.duration || 0;
     const t = player.currentTime || 0;
-    if (!(dur > 20) || t < dur - 25) return;
-    let n = state.isShuffle ? -1 : state.queueIndex + 1;
-    if (!state.isShuffle && n >= state.queue.length) n = 0;
-    if (n < 0 || !state.queue[n]) return;
+    if (!(dur > 20) || t < dur - 30) return;
+    const n = state.queueIndex + 1;
     const nxt = state.queue[n];
-    if (!nxt.id || state._warmedId === nxt.id) return;
-    state._warmedId = nxt.id;
-    // Warm AND keep the result. Reusing this on auto-next lets playVideo() set the
-    // src and call play() with no multi-second fetch in between — that fetch gap
-    // (plus blanking the element) is what let the browser block gapless autoplay.
-    const wq = state.currentQuality || 'best';
-    fetch('/video/' + encodeURIComponent(nxt.id) + '?quality=' + encodeURIComponent(wq) + '&fresh=1')
-      .then(r => r.ok ? r.json() : null)
-      .then(d => { if (d && d.video_url) state._prefetchData = { id: nxt.id, quality: wq, data: d }; })
-      .catch(()=>{});
+    if (!nxt || !nxt.id) return;
+    if (_prewarm[nxt.id] || _prewarmInflight.has(nxt.id)) return;  // already handled
+    prewarmAhead(2);
   } catch (e) {}
 });
 player.addEventListener('ended', () => {
