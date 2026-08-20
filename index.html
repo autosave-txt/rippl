@@ -3010,8 +3010,17 @@ async function playVideo(videoId, title, thumbnail, channel, quality) {
   _ignoreMediaError = true;
   try {
     player.pause();
-    player.removeAttribute('src');
-    player.load();
+    // On auto-advance, do NOT blank the element with removeAttribute('src')+load().
+    // That fully resets the media element and drops the "user already started
+    // playback" permission the browser granted on the first play — which then makes
+    // the next track's programmatic play() get blocked, so it loads but never starts.
+    // Leaving the element intact and letting setupPlayback() swap the src in place
+    // keeps that permission alive, so the next track starts on its own. On a
+    // user-initiated open there's a real gesture, so a full reset is safe.
+    if (!wasAutoNext) {
+      player.removeAttribute('src');
+      player.load();
+    }
   } catch (e) {}
   stopSplitAudio();   // kill any lingering high-quality audio so the old track can't loop
   setPlayerStatus('LOADING', true);
@@ -3080,13 +3089,26 @@ async function playVideo(videoId, title, thumbnail, channel, quality) {
   loadRelatedVideos(videoId);
 
   try {
-    // Auto-next often hits a cached response whose googlevideo URLs already expired.
-    // Request a fresh extract so the next track gets live stream URLs.
-    const freshQ = (wasAutoNext || state._forceFresh) ? '&fresh=1' : '';
-    state._forceFresh = false;
-    const res = await fetch(`/video/${videoId}?quality=${quality}${freshQ}`);
-    if (!res.ok) throw new Error(`Server error ${res.status}`);
-    const data = await res.json();
+    // Prefer the pre-warmed next-track data captured ~12s before the previous track
+    // ended. Reusing it means auto-advance sets src + play() with no multi-second
+    // fetch in between — closing the gap that let the browser block gapless autoplay.
+    let data;
+    if (wasAutoNext && state._prefetchData
+        && state._prefetchData.id === videoId
+        && state._prefetchData.quality === quality
+        && state._prefetchData.data && state._prefetchData.data.video_url) {
+      data = state._prefetchData.data;
+      state._prefetchData = null;
+      state._forceFresh = false;
+    } else {
+      // Auto-next often hits a cached response whose googlevideo URLs already expired.
+      // Request a fresh extract so the next track gets live stream URLs.
+      const freshQ = (wasAutoNext || state._forceFresh) ? '&fresh=1' : '';
+      state._forceFresh = false;
+      const res = await fetch(`/video/${videoId}?quality=${quality}${freshQ}`);
+      if (!res.ok) throw new Error(`Server error ${res.status}`);
+      data = await res.json();
+    }
 
     state.currentVideo = { ...state.currentVideo, ...data };
     updateMediaSession(state.currentVideo.title || title, state.currentVideo.channel || channel, state.currentVideo.thumbnail || thumbnail);
@@ -4336,7 +4358,14 @@ player.addEventListener('timeupdate', () => {
     const nxt = state.queue[n];
     if (!nxt.id || state._warmedId === nxt.id) return;
     state._warmedId = nxt.id;
-    fetch('/video/' + encodeURIComponent(nxt.id) + '?quality=best&fresh=1').catch(()=>{});
+    // Warm AND keep the result. Reusing this on auto-next lets playVideo() set the
+    // src and call play() with no multi-second fetch in between — that fetch gap
+    // (plus blanking the element) is what let the browser block gapless autoplay.
+    const wq = state.currentQuality || 'best';
+    fetch('/video/' + encodeURIComponent(nxt.id) + '?quality=' + encodeURIComponent(wq) + '&fresh=1')
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { if (d && d.video_url) state._prefetchData = { id: nxt.id, quality: wq, data: d }; })
+      .catch(()=>{});
   } catch (e) {}
 });
 player.addEventListener('ended', () => {
