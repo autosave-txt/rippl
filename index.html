@@ -3009,15 +3009,15 @@ async function playVideo(videoId, title, thumbnail, channel, quality) {
   // auto-next does not immediately show "this vid is NOT going to load".
   _ignoreMediaError = true;
   try {
-    player.pause();
-    // On auto-advance, do NOT blank the element with removeAttribute('src')+load().
-    // That fully resets the media element and drops the "user already started
-    // playback" permission the browser granted on the first play — which then makes
-    // the next track's programmatic play() get blocked, so it loads but never starts.
-    // Leaving the element intact and letting setupPlayback() swap the src in place
-    // keeps that permission alive, so the next track starts on its own. On a
-    // user-initiated open there's a real gesture, so a full reset is safe.
+    // On auto-advance do NOT pause() or blank the element. Calling pause() on a
+    // backgrounded element releases Android audio focus while the screen is locked, and
+    // the browser then refuses to hand focus back to a background play() on the new
+    // source — so the next track stays silent/stopped until you unlock. Leaving the
+    // element as-is and letting setupPlayback() swap the src in place keeps the media
+    // session (and lock-screen playback) alive. A user-initiated open has a real gesture
+    // and an awake screen, so the full reset there is safe.
     if (!wasAutoNext) {
+      player.pause();
       player.removeAttribute('src');
       player.load();
     }
@@ -4356,7 +4356,7 @@ player.addEventListener('timeupdate', () => {
     if (!state.queue.length || state.isRepeat) return;
     const dur = player.duration || 0;
     const t = player.currentTime || 0;
-    if (!(dur > 20) || t < dur - 12) return;
+    if (!(dur > 20) || t < dur - 25) return;
     let n = state.isShuffle ? -1 : state.queueIndex + 1;
     if (!state.isShuffle && n >= state.queue.length) n = 0;
     if (n < 0 || !state.queue[n]) return;
@@ -4375,8 +4375,14 @@ player.addEventListener('timeupdate', () => {
 });
 player.addEventListener('ended', () => {
   if (state.isRepeat) return;
-  // Defer so the ended/teardown cycle finishes before we load the next track.
-  setTimeout(() => { if (!state.isRepeat) playNext(); }, 120);
+  // Advance SYNCHRONOUSLY — do NOT defer with setTimeout. When the phone is locked the
+  // "actively playing media" exemption ends the moment the track finishes, so a deferred
+  // timer is frozen and playNext() would never run until you unlock. The browser also
+  // only lets the next track keep audio focus if its play() flows seamlessly out of this
+  // ended event. playNext()→playVideo() reuse the prewarmed next-track data, so there is
+  // no await between here and play() — which is what makes lock-screen/background
+  // auto-advance actually work.
+  playNext();
 });
 player.addEventListener('error', () => {
   // Ignore teardown / empty-src errors (common on auto-next when we clear the old track).
