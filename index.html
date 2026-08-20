@@ -3089,9 +3089,11 @@ async function playVideo(videoId, title, thumbnail, channel, quality) {
   loadRelatedVideos(videoId);
 
   try {
-    // Prefer the pre-warmed next-track data captured ~12s before the previous track
-    // ended. Reusing it means auto-advance sets src + play() with no multi-second
-    // fetch in between — closing the gap that let the browser block gapless autoplay.
+    // Prefer the next-track data the warm step already fetched ~12s before the
+    // previous track ended. The warm step does the ONE fresh extraction for this
+    // track; reusing it here means auto-advance never re-extracts the same video a
+    // second time within seconds — that rapid double-extraction is what YouTube
+    // throttles, making the second set of URLs 403 ("this vid is NOT going to load").
     let data;
     if (wasAutoNext && state._prefetchData
         && state._prefetchData.id === videoId
@@ -3101,9 +3103,12 @@ async function playVideo(videoId, title, thumbnail, channel, quality) {
       state._prefetchData = null;
       state._forceFresh = false;
     } else {
-      // Auto-next often hits a cached response whose googlevideo URLs already expired.
-      // Request a fresh extract so the next track gets live stream URLs.
-      const freshQ = (wasAutoNext || state._forceFresh) ? '&fresh=1' : '';
+      // No usable prefetch (e.g. shuffle, or warm still in flight). Do a PLAIN fetch:
+      // it hits the server cache the warm step populated and reuses that single
+      // fresh extraction. Only ask for a brand-new extract when an actual playback
+      // error set _forceFresh — never automatically on auto-advance, since doing so
+      // is exactly what triggered the throttle→403 that broke gapless playback.
+      const freshQ = state._forceFresh ? '&fresh=1' : '';
       state._forceFresh = false;
       const res = await fetch(`/video/${videoId}?quality=${quality}${freshQ}`);
       if (!res.ok) throw new Error(`Server error ${res.status}`);

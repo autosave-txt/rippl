@@ -48,6 +48,26 @@ app.add_middleware(
 _CACHE = {}
 _CACHE_LOCK = threading.Lock()
 
+# Per-video extraction locks. yt-dlp extraction is slow AND re-extracting the same
+# video twice within seconds makes YouTube throttle the second set of stream URLs
+# (they then 403 through /proxy). These locks guarantee only ONE extraction per video
+# runs at a time; any concurrent caller (warm/prefetch/hover-preview/play) waits and
+# reuses the first result instead of firing a duplicate extraction.
+_EXTRACT_LOCKS = {}
+_EXTRACT_LOCKS_GUARD = threading.Lock()
+
+def _get_extract_lock(video_id):
+    with _EXTRACT_LOCKS_GUARD:
+        lk = _EXTRACT_LOCKS.get(video_id)
+        if lk is None:
+            lk = threading.Lock()
+            _EXTRACT_LOCKS[video_id] = lk
+            # Keep the registry from growing unbounded on a long-lived server.
+            if len(_EXTRACT_LOCKS) > 512:
+                for k in [k for k in list(_EXTRACT_LOCKS) if k != video_id][:256]:
+                    _EXTRACT_LOCKS.pop(k, None)
+        return lk
+
 def cache_get(key):
     with _CACHE_LOCK:
         item = _CACHE.get(key)
@@ -589,22 +609,29 @@ def _raw_extract(video_id):
     cached = cache_get(cache_key)
     if cached:
         return cached
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    last_err = None
-    for client in ["android", None, "web", "ios", "tv"]:
-        opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True}
-        if client:
-            opts["extractor_args"] = {"youtube": {"player_client": [client]}}
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-            if info and info.get("formats"):
-                cache_set(cache_key, info, 1800)  # 30 min — stream URLs stay valid a few hours
-                return info
-        except Exception as e:
-            last_err = e
-            continue
-    raise last_err if last_err else Exception("extraction failed")
+    # Serialize per video: if another request is already extracting this id, wait for
+    # it and reuse its result rather than launching a second, throttle-triggering one.
+    lock = _get_extract_lock(video_id)
+    with lock:
+        cached = cache_get(cache_key)   # a concurrent caller may have just filled it
+        if cached:
+            return cached
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        last_err = None
+        for client in ["android", None, "web", "ios", "tv"]:
+            opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True}
+            if client:
+                opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                if info and info.get("formats"):
+                    cache_set(cache_key, info, 1800)  # 30 min — stream URLs stay valid a few hours
+                    return info
+            except Exception as e:
+                last_err = e
+                continue
+        raise last_err if last_err else Exception("extraction failed")
 
 
 
