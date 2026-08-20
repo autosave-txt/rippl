@@ -2983,11 +2983,19 @@ function stopPreview(card) {
 // VIDEO PLAYBACK — does NOT navigate to player on auto next
 // ═══════════════════════════════════════════════════════════════════════
 let _autoNext = false; // flag: true when triggered by player.ended, not user
+let _playGen = 0;       // bumps on every playVideo; ignores stale errors/fetches
+let _ignoreMediaError = false; // true while we intentionally tear down the old src
 
 async function playVideo(videoId, title, thumbnail, channel, quality) {
   // Only show player view if user triggered (not auto-next)
   if (!_autoNext) showView('player');
   _autoNext = false;
+
+  // New generation — any in-flight recovery / error from the previous track is stale.
+  _playGen += 1;
+  const myGen = _playGen;
+  state._proxyTried = false;
+  state._freshTried = false;
 
   // Track previous video for prev button
   if (state.currentVideo && state.currentVideo.id !== videoId) {
@@ -2995,9 +3003,14 @@ async function playVideo(videoId, title, thumbnail, channel, quality) {
     if (state.playHistory.length > 50) state.playHistory.shift();
   }
 
-  player.pause();
-  player.removeAttribute('src');
-  player.load();
+  // Tearing down the old src often fires a MEDIA_ERR on <video>. Ignore those so
+  // auto-next does not immediately show "this vid is NOT going to load".
+  _ignoreMediaError = true;
+  try {
+    player.pause();
+    player.removeAttribute('src');
+    player.load();
+  } catch (e) {}
   stopSplitAudio();   // kill any lingering high-quality audio so the old track can't loop
   setPlayerStatus('LOADING', true);
   // Reset seek bar immediately so old position doesn't show
@@ -3084,6 +3097,8 @@ async function playVideo(videoId, title, thumbnail, channel, quality) {
     // Refresh lyrics now that we have clean title/artist metadata
     if (lyricsOpen) openLyrics();
 
+    if (myGen !== _playGen) return; // a newer playVideo superseded this request
+
     if (!data.video_url) {
       setPlayerStatus("this vid is NOT going to load <3", true, true);
       loadComments(videoId, myReqId);
@@ -3095,13 +3110,26 @@ async function playVideo(videoId, title, thumbnail, channel, quality) {
     state._directUrl = data.video_url_direct || data.video_url;
     state._proxyUrl = data.video_url;  // already proxied by backend
     setupPlayback(data);
+    _ignoreMediaError = false;
 
     state.userPaused = false;
     setPlayerStatus('', false);
     const playPromise = player.play();
     if (playPromise) playPromise.catch((err) => {
+      if (myGen !== _playGen) return;
+      // AbortError is common when we just swapped src during auto-next — retry once.
+      if (err && err.name === 'AbortError') {
+        setTimeout(() => {
+          if (myGen !== _playGen) return;
+          player.play().catch((e2) => {
+            if (e2 && e2.name === 'NotAllowedError') showPressPlay();
+            else tryProxyFallback();
+          });
+        }, 60);
+        return;
+      }
       // Autoplay blocked by the browser is NOT a failure — prompt to press play.
-      if (err && (err.name === 'NotAllowedError' || err.name === 'AbortError')) {
+      if (err && err.name === 'NotAllowedError') {
         showPressPlay();
       } else {
         tryProxyFallback();
@@ -3115,7 +3143,9 @@ async function playVideo(videoId, title, thumbnail, channel, quality) {
     prefetchLyrics();
 
   } catch(e) {
-    if (e.message.includes('404') && quality !== 'best') {
+    if (myGen !== _playGen) return;
+    _ignoreMediaError = false;
+    if (e.message && e.message.includes('404') && quality !== 'best') {
       playVideo(videoId, title, thumbnail, channel, 'best');
       return;
     }
@@ -4272,8 +4302,16 @@ player.addEventListener('loadedmetadata', () => {
   // Now that we know the real duration, rebuild the floating-comment timings
   floatComments._needRebuild = true;
 });
-player.addEventListener('ended', () => { if(!state.isRepeat) playNext(); });
+player.addEventListener('ended', () => {
+  if (state.isRepeat) return;
+  // Defer so the ended/teardown cycle finishes before we load the next track.
+  // Fixes: auto-advanced track shows "NOT going to load" but works on manual next/prev.
+  setTimeout(() => { if (!state.isRepeat) playNext(); }, 80);
+});
 player.addEventListener('error', () => {
+  // Ignore teardown / empty-src errors (common on auto-next when we clear the old track).
+  if (_ignoreMediaError) return;
+  if (!player.getAttribute('src') && !player.currentSrc) return;
   if (state.isSplit || state.isHls) { refetchProgressive(); }
   else if (!state._proxyTried) tryProxyFallback();
   else if (!state._freshTried && state.currentVideo) { state._freshTried = true; refetchFresh(); }
