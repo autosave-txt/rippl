@@ -4,6 +4,9 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
 <title>💧 Rippl</title>
+<!-- Bump this on every deploy — it's how the app detects a stale cached copy of itself
+     and self-refreshes once, automatically, the next time it's opened. -->
+<meta name="rippl-build" content="2026-08-22-1">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@400;700;900&family=IBM+Plex+Sans:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
@@ -1816,6 +1819,41 @@
 </div>
 
 <script>
+// ═══════════════════════════════════════════════════════════════════════
+// AUTO-REFRESH ON STALE CACHE
+// Runs once, immediately, before anything else. Silently asks the server (bypassing
+// any cache — browser or CDN) what the CURRENT build actually is; if it differs from
+// what's running right now, does ONE clean reload to pull the real thing. This is what
+// makes future deploys show up automatically next time the app is opened, without ever
+// needing to manually clear browsing data again.
+//
+// Deliberately runs ONLY ONCE PER SESSION (guarded via sessionStorage) and ONLY at
+// initial load — never on a timer while the app stays open — so it can't interrupt
+// playback that's already happening. Opening the app fresh (new tab, or reopening after
+// being closed) is what triggers the check, which matches how this is actually used.
+(function () {
+  try {
+    if (sessionStorage.getItem('rippl_build_checked') === '1') return;
+    sessionStorage.setItem('rippl_build_checked', '1');
+    const myBuild = (document.querySelector('meta[name="rippl-build"]') || {}).content || '';
+    if (!myBuild) return;
+    fetch(location.pathname + '?_freshcheck=' + Date.now(), { cache: 'no-store' })
+      .then(r => r.ok ? r.text() : null)
+      .then(html => {
+        if (!html) return;
+        const m = html.match(/<meta\s+name=["']rippl-build["']\s+content=["']([^"']+)["']/i);
+        const latestBuild = m ? m[1] : '';
+        if (latestBuild && latestBuild !== myBuild) {
+          // Cache-bust via a changed query string — the one thing guaranteed to force a
+          // true network fetch regardless of what caching layers are in front of us.
+          // Keeps the current hash (view) so the reload doesn't dump the user back home.
+          location.replace(location.pathname + '?_v=' + encodeURIComponent(latestBuild) + location.hash);
+        }
+      })
+      .catch(() => {});
+  } catch (e) {}
+})();
+
 // ═══════════════════════════════════════════════════════════════════════
 // RIPPL CONNECTION LAYER
 // This file can be served two ways:
