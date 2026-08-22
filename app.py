@@ -592,6 +592,18 @@ def playlist_videos(playlist_id: str = Query(...)):
 
 # ── Video (with quality selection) ───────────────────────────────────────────
 
+def _extract_with_client(video_id, client):
+    """One-off, UNCACHED extraction pinned to a specific yt-dlp player client. Used only
+    as a targeted fallback (e.g. Audio Only needs a real audio-only DASH track, but the
+    reliability-first primary extraction's client may not expose one). Not a replacement
+    for _raw_extract's cached, multi-client-fallback path used everywhere else."""
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
+            "socket_timeout": 8, "extractor_args": {"youtube": {"player_client": [client]}}}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
 def _raw_extract(video_id):
     """Extract full info once (all formats) and cache it. This is the expensive call;
     caching it makes quality switches and repeat opens instant.
@@ -728,10 +740,29 @@ def get_video(video_id: str, quality: str = Query("best"), nohls: int = Query(0)
     # AUDIO-ONLY MODE: point the <video> element straight at an audio-only DASH track.
     # A <video> tag plays an audio-only file fine (sound only, no frame) — so this reuses
     # every existing control/sync/lock-screen code path untouched, while fetching NONE of
-    # the video bytes. If no audio-only track exists for this video, we silently fall
-    # through to normal video playback below rather than failing the request.
+    # the video bytes.
     if want_audio_only:
         au = best_audio()
+        if not au:
+            # The reliability-first primary extraction (often the "android" client, chosen
+            # for its resistance to 403s) can return a format list with NO true audio-only
+            # DASH track at all — only progressive/muxed streams. That's fine for normal
+            # playback but means Audio Only silently never engages. Make ONE targeted
+            # extra attempt with a client that reliably exposes the full DASH ladder
+            # (including audio-only) before giving up. Uncached/best-effort: failures here
+            # just fall through to normal video below, same as before.
+            try:
+                alt_info = _extract_with_client(video_id, "web")
+                alt_formats = alt_info.get("formats", []) if alt_info else []
+                alt_cand = [f for f in alt_formats
+                            if f.get("acodec", "none") != "none" and f.get("vcodec", "none") == "none"
+                            and f.get("url") and "m3u8" not in (f.get("protocol") or "")]
+                alt_cand.sort(key=lambda f: (f.get("ext") in ("m4a", "mp4"), f.get("abr") or 0), reverse=True)
+                au = alt_cand[0] if alt_cand else None
+            except Exception:
+                au = None
+        # If a given video genuinely has no audio-only track anywhere, silently fall
+        # through to normal video playback below rather than failing the request.
         if au and au.get("url"):
             video_url = au["url"]
             is_audio_only = True

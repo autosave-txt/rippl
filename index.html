@@ -476,10 +476,6 @@
     color: var(--muted);
     opacity: 0.85;
   }
-  #vc-audioonly-btn.active {
-    color: var(--accent, #4fc3f7);
-    border-color: var(--accent, #4fc3f7);
-  }
 
   /* ── LYRICS overlay — right column, stops above controls ── */
   #lyrics-overlay {
@@ -1660,7 +1656,6 @@
               <button class="vc-btn" id="vc-slowed-btn" onclick="toggleSpeedPanel()" title="Speed / pitch">SLOWED</button>
               <button class="vc-btn" id="vc-lyrics-btn" onclick="toggleLyrics()" title="Lyrics">LYRICS</button>
               <button class="vc-btn" id="vc-fc-btn" onclick="toggleFloatComments()" title="Live comments">💬</button>
-              <button class="vc-btn" id="vc-audioonly-btn" onclick="toggleAudioOnly()" title="Audio only — saves data, ideal for background/locked listening">🎧 AUDIO</button>
               <select id="vc-quality" onchange="changeQuality(this.value)">
                 <option value="best">Auto</option>
               </select>
@@ -3249,6 +3244,7 @@ async function playVideo(videoId, title, thumbnail, channel, quality) {
     state._freshTried = false;
     state._directUrl = data.video_url_direct || data.video_url;
     state._proxyUrl = data.video_url;  // already proxied by backend
+    _captureBaseFrom(data);
     setupPlayback(data);
     _ignoreMediaError = false;
 
@@ -3326,15 +3322,12 @@ function teardownHls() { if (_hls) { try { _hls.destroy(); } catch {} _hls = nul
 // but shows a blank frame) and keeps the toggle button's active state in sync. Called
 // whenever a track's data arrives, since audio-only availability is per-video (falls
 // back to normal video if a given track has no audio-only DASH track).
-// Two buttons exist for this ONE preference: the small icon in the crowded video-overlay
-// control row, and a guaranteed-visible one next to LIKE/PLAYLIST/DOWNLOAD (added because
-// the overlay row can run out of space and squeeze the icon out entirely on some phones/
-// zoom levels). Keep both in sync from a single place.
+// One button, next to LIKE/PLAYLIST/DOWNLOAD — a duplicate used to also live in the
+// crowded video-overlay control row, but that row could run out of space and squeeze it
+// out entirely on some phones/zoom levels, so it was removed; this is the only control now.
 function _syncAudioOnlyButtons() {
   try {
     const on = !!state.audioOnly;
-    const btn1 = document.getElementById('vc-audioonly-btn');
-    if (btn1) btn1.classList.toggle('active', on);
     const btn2 = document.getElementById('audioonly-btn2');
     if (btn2) {
       btn2.classList.toggle('active', on);
@@ -3380,6 +3373,7 @@ function toggleAudioOnly() {
       state.currentVideo = { ...state.currentVideo, ...data };
       state._proxyUrl = data.video_url;
       state._directUrl = data.video_url_direct || data.video_url;
+      _captureBaseFrom(data);
       _applyAudioOnlyVisual(data, state.currentVideo.thumbnail);
       setupPlayback(data);
       player.addEventListener('loadedmetadata', () => {
@@ -3536,6 +3530,7 @@ function refetchProgressive() {
     if (!data || !data.video_url) { setPlayerStatus('this vid is NOT going to load <3', true, true); return; }
     state._proxyUrl = data.video_url;
     state._directUrl = data.video_url_direct || data.video_url;
+    _captureBaseFrom(data);
     setupPlayback(data);
     player.addEventListener('loadedmetadata', () => {
       try { player.currentTime = t; } catch {}
@@ -3559,6 +3554,7 @@ function refetchFresh() {
     if (!data || (!data.video_url && !data.audio_url)) { setPlayerStatus('this vid is NOT going to load <3', true, true); return; }
     state._proxyUrl = data.video_url;
     state._directUrl = data.video_url_direct || data.video_url;
+    _captureBaseFrom(data);
     setupPlayback(data);
     player.addEventListener('loadedmetadata', () => {
       try { player.currentTime = t; } catch {}
@@ -3823,6 +3819,7 @@ function changeQuality(val) {
     const wasPaused = player.paused;
     state._proxyUrl = data.video_url;
     state._directUrl = data.video_url_direct || data.video_url;
+    _captureBaseFrom(data);
     setupPlayback(data);
     player.addEventListener('loadedmetadata', () => {
       try { player.currentTime = t; } catch {}
@@ -5232,24 +5229,26 @@ async function uploadAvatar(input) {
 // ── Downloads ────────────────────────────────────────────────────────────────
 // The frontend is served from a DIFFERENT origin (GitHub Pages) than the API. A
 // relative link like /download?... resolves against GitHub Pages and 404s there
-// instead of ever reaching the server — this is what was actually breaking downloads
-// (streaming was unaffected because video_url/proxy are already absolute). Learn the
-// server's real address once so download links can be absolute too.
+// instead of ever reaching the server. video_url in every /video response is already
+// built server-side as an ABSOLUTE url (that's why streaming works) — so instead of a
+// separate /config request (which suffers this exact same relative-fetch problem, and
+// was the bug in the previous attempt at this fix), derive the server's real origin
+// from that already-proven-working data, opportunistically, on every /video response.
 let _publicBase = '';
-fetch('/config').then(r => r.ok ? r.json() : null)
-  .then(d => { if (d && d.public_base) _publicBase = d.public_base; })
-  .catch(() => {});
+function _captureBaseFrom(data) {
+  try {
+    if (data && data.video_url) {
+      const u = new URL(data.video_url, location.href);
+      if (u.origin && u.origin !== location.origin) _publicBase = u.origin;
+    }
+  } catch (e) {}
+}
 
 function _safeDlName(s, ext) {
   s = (s || 'rippl').replace(/[\\/:*?"<>|\r\n\t]+/g, '').trim().slice(0, 120) || 'rippl';
   return s + '.' + ext;
 }
 function _triggerDownload(videoId, kind, title) {
-  // Kept SYNCHRONOUS (no await) so a.click() stays inside the original user-gesture
-  // context — some browsers block a programmatic click that's deferred past an await,
-  // treating it like an unrequested popup. /config is fetched at page load and a user
-  // needs several taps to reach this point, so _publicBase is essentially always set
-  // by now in practice.
   const ext = (kind === 'audio') ? 'm4a' : 'mp4';
   const a = document.createElement('a');
   a.href = _publicBase + '/download?video_id=' + encodeURIComponent(videoId) + '&kind=' + kind
