@@ -446,36 +446,6 @@
     cursor: pointer;
   }
 
-  /* ── Audio Only cover — sits over the (blank) video frame while the <video> element
-     is actually playing an audio-only stream, so it doesn't look broken/black. ── */
-  #audio-only-cover {
-    position: absolute;
-    inset: 0;
-    z-index: 3;
-    display: none;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 14px;
-    background: #000;
-    pointer-events: none; /* taps still reach the click-overlay beneath for play/pause */
-  }
-  #player-wrapper.audio-only #audio-only-cover { display: flex; }
-  #audio-only-art {
-    width: 46%;
-    max-width: 220px;
-    aspect-ratio: 1/1;
-    object-fit: cover;
-    border-radius: 10px;
-    box-shadow: 0 6px 24px rgba(0,0,0,0.5);
-    opacity: 0.9;
-  }
-  #audio-only-label {
-    font-size: 12px;
-    letter-spacing: 0.08em;
-    color: var(--muted);
-    opacity: 0.85;
-  }
 
   /* ── LYRICS overlay — right column, stops above controls ── */
   #lyrics-overlay {
@@ -709,13 +679,12 @@
   }
   #like-btn:hover { border-color: var(--accent); color: var(--accent); }
   #like-btn.liked { background: rgba(0,204,255,0.1); border-color: var(--accent); color: var(--accent); }
-  #playlist-btn, #download-btn, #audioonly-btn2 {
+  #playlist-btn, #download-btn {
     background: transparent; border: 2px solid var(--border); border-radius: var(--radius);
     color: var(--muted); font-family: 'Orbitron', monospace; font-size: 11px;
     padding: 7px 12px; cursor: pointer; letter-spacing: 1px; transition: all 0.15s;
   }
-  #playlist-btn:hover, #download-btn:hover, #audioonly-btn2:hover { border-color: var(--text); color: var(--text); }
-  #audioonly-btn2.active { background: rgba(0,204,255,0.1); border-color: var(--accent); color: var(--accent); }
+  #playlist-btn:hover, #download-btn:hover { border-color: var(--text); color: var(--text); }
   #video-description {
     font-size: 13px; line-height: 1.7; color: #7a7a8c;
     background: var(--surface); border: 2px solid var(--border);
@@ -1663,12 +1632,6 @@
             </div>
           </div>
 
-          <!-- Shown instead of the (blank) video frame while Audio Only is active. -->
-          <div id="audio-only-cover">
-            <img id="audio-only-art" alt="">
-            <div id="audio-only-label">🎧 AUDIO ONLY</div>
-          </div>
-
           <div id="player-status">
             <div id="player-status-text">LOADING</div>
             <div class="ps-dots"><span>.</span><span>.</span><span>.</span></div>
@@ -1686,7 +1649,6 @@
             <button id="like-btn" onclick="toggleLike()">♥ LIKE</button>
             <button id="playlist-btn" onclick="openAddToPlaylist()">+ PLAYLIST</button>
             <button id="download-btn" onclick="openDownload()">⬇ DOWNLOAD</button>
-            <button id="audioonly-btn2" onclick="toggleAudioOnly()" title="Audio only — saves data, ideal for background/locked listening">🎧 AUDIO ONLY: OFF</button>
           </div>
           <div id="video-description"></div>
         </div>
@@ -1969,9 +1931,6 @@ const state = {
   user: null,
   avatar: null,
   _feedCache: {},
-  // Audio Only: play the audio-only stream (no video bytes fetched at all) — big data
-  // saver, and especially good for locked/background listening. Persisted across visits.
-  audioOnly: (() => { try { return localStorage.getItem('mytube_audio_only') === '1'; } catch { return false; } })(),
 };
 
 // View modes
@@ -3035,24 +2994,20 @@ let _ignoreMediaError = false; // true while we intentionally tear down the old 
 // We therefore prewarm the next few tracks AS SOON AS the current one starts playing
 // (while the app is still foreground/active), and buffer several ahead. Auto-advance
 // then reuses this data as a pure media swap with zero network in the background.
-const _prewarm = {};                 // id -> { quality, audioOnly, data }
+const _prewarm = {};                 // id -> { quality, data }
 const _prewarmInflight = new Set();   // ids currently being fetched (avoid duplicates)
 
 function _prewarmOne(track, quality) {
   if (!track || !track.id) return;
   const id = track.id;
-  const ao = !!state.audioOnly;
-  if (_prewarm[id] && _prewarm[id].quality === quality && _prewarm[id].audioOnly === ao) return; // already buffered
+  if (_prewarm[id] && _prewarm[id].quality === quality) return;  // already buffered
   if (_prewarmInflight.has(id)) return;                          // already fetching
   _prewarmInflight.add(id);
   // Plain (non-fresh) fetch: reuses the server's cached extraction (the reliable one),
-  // and the server's per-video lock stops any duplicate extraction. audio_only=1 makes
-  // this prewarm the tiny audio-only stream instead of video — keeps background/locked
-  // buffering itself lightweight on data when the user has Audio Only enabled.
-  const aoQ = ao ? '&audio_only=1' : '';
-  fetch('/video/' + encodeURIComponent(id) + '?quality=' + encodeURIComponent(quality) + aoQ)
+  // and the server's per-video lock stops any duplicate extraction.
+  fetch('/video/' + encodeURIComponent(id) + '?quality=' + encodeURIComponent(quality))
     .then(r => r.ok ? r.json() : null)
-    .then(d => { if (d && d.video_url) _prewarm[id] = { quality, audioOnly: ao, data: d }; })
+    .then(d => { if (d && d.video_url) _prewarm[id] = { quality, data: d }; })
     .catch(() => {})
     .finally(() => { _prewarmInflight.delete(id); });
 }
@@ -3191,7 +3146,6 @@ async function playVideo(videoId, title, thumbnail, channel, quality) {
     // tap-to-play latency: by the time the click fires, the fetch may already be done.
     let data;
     const pw = (_prewarm[videoId] && _prewarm[videoId].quality === quality
-                && _prewarm[videoId].audioOnly === !!state.audioOnly
                 && _prewarm[videoId].data && _prewarm[videoId].data.video_url)
                ? _prewarm[videoId] : null;
     if (pw) {
@@ -3202,16 +3156,14 @@ async function playVideo(videoId, title, thumbnail, channel, quality) {
       // No prewarm available (shuffle, cold start, or a genuine error retry). Fetch it.
       // Only ask for a brand-new extract when a real playback error set _forceFresh.
       const freshQ = state._forceFresh ? '&fresh=1' : '';
-      const aoQ = state.audioOnly ? '&audio_only=1' : '';
       state._forceFresh = false;
-      const res = await fetch(`/video/${videoId}?quality=${quality}${freshQ}${aoQ}`);
+      const res = await fetch(`/video/${videoId}?quality=${quality}${freshQ}`);
       if (!res.ok) throw new Error(`Server error ${res.status}`);
       data = await res.json();
     }
 
     state.currentVideo = { ...state.currentVideo, ...data };
     updateMediaSession(state.currentVideo.title || title, state.currentVideo.channel || channel, state.currentVideo.thumbnail || thumbnail);
-    _applyAudioOnlyVisual(data, data.thumbnail || thumbnail);
 
     document.getElementById('video-title').textContent  = data.title   || title   || '—';
     document.getElementById('meta-channel').textContent = data.channel || channel || '—';
@@ -3316,75 +3268,6 @@ function stopSplitAudio() { try { audioEl.pause(); audioEl.removeAttribute('src'
 
 let _hls = null;
 function teardownHls() { if (_hls) { try { _hls.destroy(); } catch {} _hls = null; } }
-
-// ── Audio Only mode ──────────────────────────────────────────────────────────
-// Shows/hides the cover-art overlay (the <video> element plays audio-only streams fine,
-// but shows a blank frame) and keeps the toggle button's active state in sync. Called
-// whenever a track's data arrives, since audio-only availability is per-video (falls
-// back to normal video if a given track has no audio-only DASH track).
-// One button, next to LIKE/PLAYLIST/DOWNLOAD — a duplicate used to also live in the
-// crowded video-overlay control row, but that row could run out of space and squeeze it
-// out entirely on some phones/zoom levels, so it was removed; this is the only control now.
-function _syncAudioOnlyButtons() {
-  try {
-    const on = !!state.audioOnly;
-    const btn2 = document.getElementById('audioonly-btn2');
-    if (btn2) {
-      btn2.classList.toggle('active', on);
-      btn2.textContent = on ? '🎧 AUDIO ONLY: ON' : '🎧 AUDIO ONLY: OFF';
-    }
-  } catch (e) {}
-}
-function _applyAudioOnlyVisual(data, thumbnail) {
-  try {
-    const wrap = document.getElementById('player-wrapper');
-    _syncAudioOnlyButtons();
-    if (!wrap) return;
-    const active = !!(data && data.is_audio_only);
-    wrap.classList.toggle('audio-only', active);
-    if (active) {
-      const art = document.getElementById('audio-only-art');
-      if (art) art.src = thumbnail || (data && data.thumbnail) || '';
-    }
-  } catch (e) {}
-}
-
-// Toggle Audio Only on/off. Persists the preference and — if something is currently
-// playing — reloads the current track in the new mode at the same position, the same
-// way changing quality does.
-function toggleAudioOnly() {
-  state.audioOnly = !state.audioOnly;
-  try { localStorage.setItem('mytube_audio_only', state.audioOnly ? '1' : '0'); } catch {}
-  _syncAudioOnlyButtons();
-  toast(state.audioOnly ? '🎧 Audio Only ON — saves data' : 'Audio Only off', 2500);
-  // Any previously-prewarmed tracks were fetched under the OLD mode — drop them so the
-  // next advance re-fetches in the mode that's actually active now.
-  for (const k of Object.keys(_prewarm)) delete _prewarm[k];
-
-  if (!state.currentVideo || !state.currentVideo.id) return;
-  const t = player.currentTime || 0;
-  const wasPaused = player.paused;
-  const q = (state.currentQuality && state.currentQuality !== 'auto') ? state.currentQuality : 'best';
-  setPlayerStatus('LOADING', true);
-  fetch(`/video/${state.currentVideo.id}?quality=${encodeURIComponent(q)}&fresh=1${state.audioOnly ? '&audio_only=1' : ''}`)
-    .then(r => r.json())
-    .then(data => {
-      if (!data || !data.video_url) { setPlayerStatus('this vid is NOT going to load <3', true, true); return; }
-      state.currentVideo = { ...state.currentVideo, ...data };
-      state._proxyUrl = data.video_url;
-      state._directUrl = data.video_url_direct || data.video_url;
-      _captureBaseFrom(data);
-      _applyAudioOnlyVisual(data, state.currentVideo.thumbnail);
-      setupPlayback(data);
-      player.addEventListener('loadedmetadata', () => {
-        try { player.currentTime = t; } catch {}
-        applyPlaybackRate();
-        if (!wasPaused) player.play().catch(()=>{});
-        setPlayerStatus('', false);
-      }, { once: true });
-    })
-    .catch(() => setPlayerStatus('this vid is NOT going to load <3', true, true));
-}
 
 function setupPlayback(data) {
   stopSplitAudio();
@@ -3526,7 +3409,7 @@ function refetchProgressive() {
   const wasPaused = player.paused;
   setPlayerStatus('LOADING', true);
   const q = (state.currentQuality && state.currentQuality !== 'auto') ? state.currentQuality : 'best';
-  fetch(`/video/${state.currentVideo.id}?quality=${encodeURIComponent(q)}&fresh=1${state.audioOnly ? '&audio_only=1' : ''}`).then(r=>r.json()).then(data => {
+  fetch(`/video/${state.currentVideo.id}?quality=${encodeURIComponent(q)}&fresh=1`).then(r=>r.json()).then(data => {
     if (!data || !data.video_url) { setPlayerStatus('this vid is NOT going to load <3', true, true); return; }
     state._proxyUrl = data.video_url;
     state._directUrl = data.video_url_direct || data.video_url;
@@ -3550,7 +3433,7 @@ function refetchFresh() {
   const wasPaused = player.paused;
   const q = (state.currentQuality && state.currentQuality !== 'auto') ? state.currentQuality : 'best';
   setPlayerStatus('REFRESHING', true);
-  fetch(`/video/${state.currentVideo.id}?quality=${encodeURIComponent(q)}&fresh=1${state.audioOnly ? '&audio_only=1' : ''}`).then(r=>r.json()).then(data => {
+  fetch(`/video/${state.currentVideo.id}?quality=${encodeURIComponent(q)}&fresh=1`).then(r=>r.json()).then(data => {
     if (!data || (!data.video_url && !data.audio_url)) { setPlayerStatus('this vid is NOT going to load <3', true, true); return; }
     state._proxyUrl = data.video_url;
     state._directUrl = data.video_url_direct || data.video_url;
@@ -3814,7 +3697,7 @@ function changeQuality(val) {
   const t = player.currentTime;
   state.currentQuality = val;
   setPlayerStatus('LOADING', true);
-  fetch(`/video/${v.id}?quality=${val}${state.audioOnly ? '&audio_only=1' : ''}`).then(r => r.json()).then(data => {
+  fetch(`/video/${v.id}?quality=${val}`).then(r => r.json()).then(data => {
     if (!data.video_url) { setPlayerStatus('', false); return; }
     const wasPaused = player.paused;
     state._proxyUrl = data.video_url;
@@ -5248,26 +5131,22 @@ function _safeDlName(s, ext) {
   s = (s || 'rippl').replace(/[\\/:*?"<>|\r\n\t]+/g, '').trim().slice(0, 120) || 'rippl';
   return s + '.' + ext;
 }
-function _triggerDownload(videoId, kind, title) {
-  const ext = (kind === 'audio') ? 'm4a' : 'mp4';
+function _triggerDownload(videoId, title) {
   const a = document.createElement('a');
-  a.href = _publicBase + '/download?video_id=' + encodeURIComponent(videoId) + '&kind=' + kind
+  a.href = _publicBase + '/download?video_id=' + encodeURIComponent(videoId) + '&kind=video'
          + '&name=' + encodeURIComponent(title || '');
-  a.download = _safeDlName(title, ext);   // browser hint; server's Content-Disposition is authoritative
+  a.download = _safeDlName(title, 'mp4');   // browser hint; server's Content-Disposition is authoritative
   a.rel = 'noopener';
   document.body.appendChild(a);
   a.click();
   setTimeout(() => a.remove(), 1000);
-  toast(kind === 'audio' ? 'Downloading audio…' : 'Downloading video…', 3500);
+  toast('Downloading video…', 3500);
 }
+// AUDIO (M4A) download removed — it was serving the same file as the video download
+// (a real bug), so only the working video download remains for now.
 function downloadVideoObj(v) {
   if (!v || !v.id) { toast('Nothing to download'); return; }
-  const t = v.title || '';
-  openModal('DOWNLOAD', `<div style="font-size:13px;color:var(--muted);margin-bottom:4px">${esc(t)}</div>`, [
-    { label: '🎬 VIDEO (MP4)', action: () => { closeModal(); _triggerDownload(v.id, 'video', t); } },
-    { label: '🎵 AUDIO (M4A)', action: () => { closeModal(); _triggerDownload(v.id, 'audio', t); } },
-    { label: 'CANCEL', cls: 'ghost', action: closeModal },
-  ]);
+  _triggerDownload(v.id, v.title || '');
 }
 function openDownload() {
   downloadVideoObj(state.currentVideo);
@@ -5344,7 +5223,6 @@ function updateMediaSession(title, channel, thumbnail) {
 
 try { refreshAuth(); } catch (e) { console.error(e); }
 try { refreshLikedCache(); } catch (e) { console.error(e); }
-try { _syncAudioOnlyButtons(); } catch (e) {}
 // Restore where the user was on reload, instead of always dumping them on Home.
 (function restoreSession(){
   let lastVideo = null;

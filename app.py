@@ -592,18 +592,6 @@ def playlist_videos(playlist_id: str = Query(...)):
 
 # ── Video (with quality selection) ───────────────────────────────────────────
 
-def _extract_with_client(video_id, client):
-    """One-off, UNCACHED extraction pinned to a specific yt-dlp player client. Used only
-    as a targeted fallback (e.g. Audio Only needs a real audio-only DASH track, but the
-    reliability-first primary extraction's client may not expose one). Not a replacement
-    for _raw_extract's cached, multi-client-fallback path used everywhere else."""
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
-            "socket_timeout": 8, "extractor_args": {"youtube": {"player_client": [client]}}}
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
-
-
 def _raw_extract(video_id):
     """Extract full info once (all formats) and cache it. This is the expensive call;
     caching it makes quality switches and repeat opens instant.
@@ -658,7 +646,7 @@ _VALID_ID = _re.compile(r'^[A-Za-z0-9_-]{11}$')
 
 @app.get("/video/{video_id}")
 def get_video(video_id: str, quality: str = Query("best"), nohls: int = Query(0), nosplit: int = Query(0),
-               fresh: int = Query(0), audio_only: int = Query(0)):
+               fresh: int = Query(0)):
     # Reject malformed IDs immediately. A bad id (e.g. "#", truncated) otherwise sends
     # yt-dlp into a multi-client retry storm that floods logs and hammers the device.
     if not _VALID_ID.match(video_id or ""):
@@ -674,10 +662,9 @@ def get_video(video_id: str, quality: str = Query("best"), nohls: int = Query(0)
     # (muxed) stream, never split" so that fallback path plays with audio instead of a
     # silent/black video-only stream.
     single_element = bool(nosplit or nohls)
-    want_audio_only = bool(audio_only)
 
     # Short per-(video,quality) response cache so repeated opens are instant.
-    resp_key = f"video::{video_id}::{quality}::{int(single_element)}::{int(want_audio_only)}"
+    resp_key = f"video::{video_id}::{quality}::{int(single_element)}"
     cached = cache_get(resp_key)
     if cached:
         return cached
@@ -735,38 +722,6 @@ def get_video(video_id: str, quality: str = Query("best"), nohls: int = Query(0)
     video_url = None
     audio_url = None
     is_split = False
-    is_audio_only = False
-
-    # AUDIO-ONLY MODE: point the <video> element straight at an audio-only DASH track.
-    # A <video> tag plays an audio-only file fine (sound only, no frame) — so this reuses
-    # every existing control/sync/lock-screen code path untouched, while fetching NONE of
-    # the video bytes.
-    if want_audio_only:
-        au = best_audio()
-        if not au:
-            # The reliability-first primary extraction (often the "android" client, chosen
-            # for its resistance to 403s) can return a format list with NO true audio-only
-            # DASH track at all — only progressive/muxed streams. That's fine for normal
-            # playback but means Audio Only silently never engages. Make ONE targeted
-            # extra attempt with a client that reliably exposes the full DASH ladder
-            # (including audio-only) before giving up. Uncached/best-effort: failures here
-            # just fall through to normal video below, same as before.
-            try:
-                alt_info = _extract_with_client(video_id, "web")
-                alt_formats = alt_info.get("formats", []) if alt_info else []
-                alt_cand = [f for f in alt_formats
-                            if f.get("acodec", "none") != "none" and f.get("vcodec", "none") == "none"
-                            and f.get("url") and "m3u8" not in (f.get("protocol") or "")]
-                alt_cand.sort(key=lambda f: (f.get("ext") in ("m4a", "mp4"), f.get("abr") or 0), reverse=True)
-                au = alt_cand[0] if alt_cand else None
-            except Exception:
-                au = None
-        # If a given video genuinely has no audio-only track anywhere, silently fall
-        # through to normal video playback below rather than failing the request.
-        if au and au.get("url"):
-            video_url = au["url"]
-            is_audio_only = True
-
 
     # RELIABILITY FIRST (blocked residential IPs):
     # Progressive/muxed streams (especially android 360p) often work when DASH
@@ -819,7 +774,6 @@ def get_video(video_id: str, quality: str = Query("best"), nohls: int = Query(0)
         # changes needed, just reusing the mechanism that already makes streaming work.
         "public_base": PUBLIC_BASE,
         "is_split": is_split,
-        "is_audio_only": is_audio_only,
         "is_hls": False,
         "thumbnail": thumbnail,
         "channel": channel,
