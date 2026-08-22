@@ -713,12 +713,13 @@
   }
   #like-btn:hover { border-color: var(--accent); color: var(--accent); }
   #like-btn.liked { background: rgba(0,204,255,0.1); border-color: var(--accent); color: var(--accent); }
-  #playlist-btn, #download-btn {
+  #playlist-btn, #download-btn, #audioonly-btn2 {
     background: transparent; border: 2px solid var(--border); border-radius: var(--radius);
     color: var(--muted); font-family: 'Orbitron', monospace; font-size: 11px;
     padding: 7px 12px; cursor: pointer; letter-spacing: 1px; transition: all 0.15s;
   }
-  #playlist-btn:hover, #download-btn:hover { border-color: var(--text); color: var(--text); }
+  #playlist-btn:hover, #download-btn:hover, #audioonly-btn2:hover { border-color: var(--text); color: var(--text); }
+  #audioonly-btn2.active { background: rgba(0,204,255,0.1); border-color: var(--accent); color: var(--accent); }
   #video-description {
     font-size: 13px; line-height: 1.7; color: #7a7a8c;
     background: var(--surface); border: 2px solid var(--border);
@@ -1659,7 +1660,7 @@
               <button class="vc-btn" id="vc-slowed-btn" onclick="toggleSpeedPanel()" title="Speed / pitch">SLOWED</button>
               <button class="vc-btn" id="vc-lyrics-btn" onclick="toggleLyrics()" title="Lyrics">LYRICS</button>
               <button class="vc-btn" id="vc-fc-btn" onclick="toggleFloatComments()" title="Live comments">💬</button>
-              <button class="vc-btn" id="vc-audioonly-btn" onclick="toggleAudioOnly()" title="Audio only — saves data, ideal for background/locked listening">🎧</button>
+              <button class="vc-btn" id="vc-audioonly-btn" onclick="toggleAudioOnly()" title="Audio only — saves data, ideal for background/locked listening">🎧 AUDIO</button>
               <select id="vc-quality" onchange="changeQuality(this.value)">
                 <option value="best">Auto</option>
               </select>
@@ -1690,6 +1691,7 @@
             <button id="like-btn" onclick="toggleLike()">♥ LIKE</button>
             <button id="playlist-btn" onclick="openAddToPlaylist()">+ PLAYLIST</button>
             <button id="download-btn" onclick="openDownload()">⬇ DOWNLOAD</button>
+            <button id="audioonly-btn2" onclick="toggleAudioOnly()" title="Audio only — saves data, ideal for background/locked listening">🎧 AUDIO ONLY: OFF</button>
           </div>
           <div id="video-description"></div>
         </div>
@@ -3189,9 +3191,11 @@ async function playVideo(videoId, title, thumbnail, channel, quality) {
     // Prefer PREWARMED next-track data (fetched earlier, while the app was foreground).
     // When the screen is locked Brave freezes fetch(), so the only way auto-advance can
     // work is if the stream data is already in memory — then this is a pure media swap
-    // with no background network at all.
+    // with no background network at all. Reused for ANY play (not just auto-advance) —
+    // this is also what makes tap-ahead prefetch (touchstart on a card) actually cut
+    // tap-to-play latency: by the time the click fires, the fetch may already be done.
     let data;
-    const pw = (wasAutoNext && _prewarm[videoId] && _prewarm[videoId].quality === quality
+    const pw = (_prewarm[videoId] && _prewarm[videoId].quality === quality
                 && _prewarm[videoId].audioOnly === !!state.audioOnly
                 && _prewarm[videoId].data && _prewarm[videoId].data.video_url)
                ? _prewarm[videoId] : null;
@@ -3322,11 +3326,26 @@ function teardownHls() { if (_hls) { try { _hls.destroy(); } catch {} _hls = nul
 // but shows a blank frame) and keeps the toggle button's active state in sync. Called
 // whenever a track's data arrives, since audio-only availability is per-video (falls
 // back to normal video if a given track has no audio-only DASH track).
+// Two buttons exist for this ONE preference: the small icon in the crowded video-overlay
+// control row, and a guaranteed-visible one next to LIKE/PLAYLIST/DOWNLOAD (added because
+// the overlay row can run out of space and squeeze the icon out entirely on some phones/
+// zoom levels). Keep both in sync from a single place.
+function _syncAudioOnlyButtons() {
+  try {
+    const on = !!state.audioOnly;
+    const btn1 = document.getElementById('vc-audioonly-btn');
+    if (btn1) btn1.classList.toggle('active', on);
+    const btn2 = document.getElementById('audioonly-btn2');
+    if (btn2) {
+      btn2.classList.toggle('active', on);
+      btn2.textContent = on ? '🎧 AUDIO ONLY: ON' : '🎧 AUDIO ONLY: OFF';
+    }
+  } catch (e) {}
+}
 function _applyAudioOnlyVisual(data, thumbnail) {
   try {
     const wrap = document.getElementById('player-wrapper');
-    const btn = document.getElementById('vc-audioonly-btn');
-    if (btn) btn.classList.toggle('active', !!state.audioOnly);
+    _syncAudioOnlyButtons();
     if (!wrap) return;
     const active = !!(data && data.is_audio_only);
     wrap.classList.toggle('audio-only', active);
@@ -3343,8 +3362,7 @@ function _applyAudioOnlyVisual(data, thumbnail) {
 function toggleAudioOnly() {
   state.audioOnly = !state.audioOnly;
   try { localStorage.setItem('mytube_audio_only', state.audioOnly ? '1' : '0'); } catch {}
-  const btn = document.getElementById('vc-audioonly-btn');
-  if (btn) btn.classList.toggle('active', state.audioOnly);
+  _syncAudioOnlyButtons();
   toast(state.audioOnly ? '🎧 Audio Only ON — saves data' : 'Audio Only off', 2500);
   // Any previously-prewarmed tracks were fetched under the OLD mode — drop them so the
   // next advance re-fetches in the mode that's actually active now.
@@ -5212,14 +5230,29 @@ async function uploadAvatar(input) {
   } catch { toast('Could not process image'); }
 }
 // ── Downloads ────────────────────────────────────────────────────────────────
+// The frontend is served from a DIFFERENT origin (GitHub Pages) than the API. A
+// relative link like /download?... resolves against GitHub Pages and 404s there
+// instead of ever reaching the server — this is what was actually breaking downloads
+// (streaming was unaffected because video_url/proxy are already absolute). Learn the
+// server's real address once so download links can be absolute too.
+let _publicBase = '';
+fetch('/config').then(r => r.ok ? r.json() : null)
+  .then(d => { if (d && d.public_base) _publicBase = d.public_base; })
+  .catch(() => {});
+
 function _safeDlName(s, ext) {
   s = (s || 'rippl').replace(/[\\/:*?"<>|\r\n\t]+/g, '').trim().slice(0, 120) || 'rippl';
   return s + '.' + ext;
 }
 function _triggerDownload(videoId, kind, title) {
+  // Kept SYNCHRONOUS (no await) so a.click() stays inside the original user-gesture
+  // context — some browsers block a programmatic click that's deferred past an await,
+  // treating it like an unrequested popup. /config is fetched at page load and a user
+  // needs several taps to reach this point, so _publicBase is essentially always set
+  // by now in practice.
   const ext = (kind === 'audio') ? 'm4a' : 'mp4';
   const a = document.createElement('a');
-  a.href = '/download?video_id=' + encodeURIComponent(videoId) + '&kind=' + kind
+  a.href = _publicBase + '/download?video_id=' + encodeURIComponent(videoId) + '&kind=' + kind
          + '&name=' + encodeURIComponent(title || '');
   a.download = _safeDlName(title, ext);   // browser hint; server's Content-Disposition is authoritative
   a.rel = 'noopener';
@@ -5312,10 +5345,7 @@ function updateMediaSession(title, channel, thumbnail) {
 
 try { refreshAuth(); } catch (e) { console.error(e); }
 try { refreshLikedCache(); } catch (e) { console.error(e); }
-try {
-  const aoBtn = document.getElementById('vc-audioonly-btn');
-  if (aoBtn) aoBtn.classList.toggle('active', !!state.audioOnly);
-} catch (e) {}
+try { _syncAudioOnlyButtons(); } catch (e) {}
 // Restore where the user was on reload, instead of always dumping them on Home.
 (function restoreSession(){
   let lastVideo = null;

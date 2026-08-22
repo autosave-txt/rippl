@@ -619,7 +619,11 @@ def _raw_extract(video_id):
         url = f"https://www.youtube.com/watch?v={video_id}"
         last_err = None
         for client in ["android", None, "web", "ios", "tv"]:
-            opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True}
+            opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
+                    # Fail a stalled/blocked client fast (default is 20s) so the fallback
+                    # chain below doesn't stack multiple 20s hangs before finding one that
+                    # works — this was a real source of slow FIRST loads (cache misses).
+                    "socket_timeout": 8}
             if client:
                 opts["extractor_args"] = {"youtube": {"player_client": [client]}}
             try:
@@ -777,6 +781,12 @@ def get_video(video_id: str, quality: str = Query("best"), nohls: int = Query(0)
         "video_url": f"{PUBLIC_BASE}/proxy?url={quote(video_url, safe='')}",
         "video_url_direct": video_url,
         "audio_url": (f"{PUBLIC_BASE}/proxy?url={quote(audio_url, safe='')}" if audio_url else None),
+        # The frontend is served from GitHub Pages (a DIFFERENT origin than this API).
+        # A relative link like <a href="/download?..."> resolves against GitHub Pages,
+        # not this server, and 404s there. Sending public_base lets the client build an
+        # ABSOLUTE download link the same way video_url already is — no Cloudflare/DNS
+        # changes needed, just reusing the mechanism that already makes streaming work.
+        "public_base": PUBLIC_BASE,
         "is_split": is_split,
         "is_audio_only": is_audio_only,
         "is_hls": False,
@@ -1065,6 +1075,16 @@ async def proxy_stream(url: str = Query(...), request: Request = None):
         media_type=media_type,
         headers=passthrough,
     )
+
+
+@app.get("/config")
+def get_config():
+    """Lets the frontend learn the server's real public origin once at load time, so it
+    can build absolute links (e.g. downloads) the same way /video already builds
+    video_url/proxy — needed because the frontend is served from a different origin
+    (GitHub Pages) than this API, so a relative link/fetch would resolve against the
+    wrong host and 404 there instead of reaching this server."""
+    return {"public_base": PUBLIC_BASE}
 
 
 @app.get("/health")
