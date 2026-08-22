@@ -446,6 +446,41 @@
     cursor: pointer;
   }
 
+  /* ── Audio Only cover — sits over the (blank) video frame while the <video> element
+     is actually playing an audio-only stream, so it doesn't look broken/black. ── */
+  #audio-only-cover {
+    position: absolute;
+    inset: 0;
+    z-index: 3;
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    background: #000;
+    pointer-events: none; /* taps still reach the click-overlay beneath for play/pause */
+  }
+  #player-wrapper.audio-only #audio-only-cover { display: flex; }
+  #audio-only-art {
+    width: 46%;
+    max-width: 220px;
+    aspect-ratio: 1/1;
+    object-fit: cover;
+    border-radius: 10px;
+    box-shadow: 0 6px 24px rgba(0,0,0,0.5);
+    opacity: 0.9;
+  }
+  #audio-only-label {
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    opacity: 0.85;
+  }
+  #vc-audioonly-btn.active {
+    color: var(--accent, #4fc3f7);
+    border-color: var(--accent, #4fc3f7);
+  }
+
   /* ── LYRICS overlay — right column, stops above controls ── */
   #lyrics-overlay {
     position: absolute;
@@ -1624,11 +1659,18 @@
               <button class="vc-btn" id="vc-slowed-btn" onclick="toggleSpeedPanel()" title="Speed / pitch">SLOWED</button>
               <button class="vc-btn" id="vc-lyrics-btn" onclick="toggleLyrics()" title="Lyrics">LYRICS</button>
               <button class="vc-btn" id="vc-fc-btn" onclick="toggleFloatComments()" title="Live comments">💬</button>
+              <button class="vc-btn" id="vc-audioonly-btn" onclick="toggleAudioOnly()" title="Audio only — saves data, ideal for background/locked listening">🎧</button>
               <select id="vc-quality" onchange="changeQuality(this.value)">
                 <option value="best">Auto</option>
               </select>
               <button class="vc-btn" id="vc-fullscreen" onclick="vcFullscreen()" title="Fullscreen">⛶</button>
             </div>
+          </div>
+
+          <!-- Shown instead of the (blank) video frame while Audio Only is active. -->
+          <div id="audio-only-cover">
+            <img id="audio-only-art" alt="">
+            <div id="audio-only-label">🎧 AUDIO ONLY</div>
           </div>
 
           <div id="player-status">
@@ -1930,6 +1972,9 @@ const state = {
   user: null,
   avatar: null,
   _feedCache: {},
+  // Audio Only: play the audio-only stream (no video bytes fetched at all) — big data
+  // saver, and especially good for locked/background listening. Persisted across visits.
+  audioOnly: (() => { try { return localStorage.getItem('mytube_audio_only') === '1'; } catch { return false; } })(),
 };
 
 // View modes
@@ -2993,20 +3038,24 @@ let _ignoreMediaError = false; // true while we intentionally tear down the old 
 // We therefore prewarm the next few tracks AS SOON AS the current one starts playing
 // (while the app is still foreground/active), and buffer several ahead. Auto-advance
 // then reuses this data as a pure media swap with zero network in the background.
-const _prewarm = {};                 // id -> { quality, data }
+const _prewarm = {};                 // id -> { quality, audioOnly, data }
 const _prewarmInflight = new Set();   // ids currently being fetched (avoid duplicates)
 
 function _prewarmOne(track, quality) {
   if (!track || !track.id) return;
   const id = track.id;
-  if (_prewarm[id] && _prewarm[id].quality === quality) return;  // already buffered
+  const ao = !!state.audioOnly;
+  if (_prewarm[id] && _prewarm[id].quality === quality && _prewarm[id].audioOnly === ao) return; // already buffered
   if (_prewarmInflight.has(id)) return;                          // already fetching
   _prewarmInflight.add(id);
   // Plain (non-fresh) fetch: reuses the server's cached extraction (the reliable one),
-  // and the server's per-video lock stops any duplicate extraction.
-  fetch('/video/' + encodeURIComponent(id) + '?quality=' + encodeURIComponent(quality))
+  // and the server's per-video lock stops any duplicate extraction. audio_only=1 makes
+  // this prewarm the tiny audio-only stream instead of video — keeps background/locked
+  // buffering itself lightweight on data when the user has Audio Only enabled.
+  const aoQ = ao ? '&audio_only=1' : '';
+  fetch('/video/' + encodeURIComponent(id) + '?quality=' + encodeURIComponent(quality) + aoQ)
     .then(r => r.ok ? r.json() : null)
-    .then(d => { if (d && d.video_url) _prewarm[id] = { quality, data: d }; })
+    .then(d => { if (d && d.video_url) _prewarm[id] = { quality, audioOnly: ao, data: d }; })
     .catch(() => {})
     .finally(() => { _prewarmInflight.delete(id); });
 }
@@ -3143,6 +3192,7 @@ async function playVideo(videoId, title, thumbnail, channel, quality) {
     // with no background network at all.
     let data;
     const pw = (wasAutoNext && _prewarm[videoId] && _prewarm[videoId].quality === quality
+                && _prewarm[videoId].audioOnly === !!state.audioOnly
                 && _prewarm[videoId].data && _prewarm[videoId].data.video_url)
                ? _prewarm[videoId] : null;
     if (pw) {
@@ -3153,14 +3203,16 @@ async function playVideo(videoId, title, thumbnail, channel, quality) {
       // No prewarm available (shuffle, cold start, or a genuine error retry). Fetch it.
       // Only ask for a brand-new extract when a real playback error set _forceFresh.
       const freshQ = state._forceFresh ? '&fresh=1' : '';
+      const aoQ = state.audioOnly ? '&audio_only=1' : '';
       state._forceFresh = false;
-      const res = await fetch(`/video/${videoId}?quality=${quality}${freshQ}`);
+      const res = await fetch(`/video/${videoId}?quality=${quality}${freshQ}${aoQ}`);
       if (!res.ok) throw new Error(`Server error ${res.status}`);
       data = await res.json();
     }
 
     state.currentVideo = { ...state.currentVideo, ...data };
     updateMediaSession(state.currentVideo.title || title, state.currentVideo.channel || channel, state.currentVideo.thumbnail || thumbnail);
+    _applyAudioOnlyVisual(data, data.thumbnail || thumbnail);
 
     document.getElementById('video-title').textContent  = data.title   || title   || '—';
     document.getElementById('meta-channel').textContent = data.channel || channel || '—';
@@ -3264,6 +3316,63 @@ function stopSplitAudio() { try { audioEl.pause(); audioEl.removeAttribute('src'
 
 let _hls = null;
 function teardownHls() { if (_hls) { try { _hls.destroy(); } catch {} _hls = null; } }
+
+// ── Audio Only mode ──────────────────────────────────────────────────────────
+// Shows/hides the cover-art overlay (the <video> element plays audio-only streams fine,
+// but shows a blank frame) and keeps the toggle button's active state in sync. Called
+// whenever a track's data arrives, since audio-only availability is per-video (falls
+// back to normal video if a given track has no audio-only DASH track).
+function _applyAudioOnlyVisual(data, thumbnail) {
+  try {
+    const wrap = document.getElementById('player-wrapper');
+    const btn = document.getElementById('vc-audioonly-btn');
+    if (btn) btn.classList.toggle('active', !!state.audioOnly);
+    if (!wrap) return;
+    const active = !!(data && data.is_audio_only);
+    wrap.classList.toggle('audio-only', active);
+    if (active) {
+      const art = document.getElementById('audio-only-art');
+      if (art) art.src = thumbnail || (data && data.thumbnail) || '';
+    }
+  } catch (e) {}
+}
+
+// Toggle Audio Only on/off. Persists the preference and — if something is currently
+// playing — reloads the current track in the new mode at the same position, the same
+// way changing quality does.
+function toggleAudioOnly() {
+  state.audioOnly = !state.audioOnly;
+  try { localStorage.setItem('mytube_audio_only', state.audioOnly ? '1' : '0'); } catch {}
+  const btn = document.getElementById('vc-audioonly-btn');
+  if (btn) btn.classList.toggle('active', state.audioOnly);
+  toast(state.audioOnly ? '🎧 Audio Only ON — saves data' : 'Audio Only off', 2500);
+  // Any previously-prewarmed tracks were fetched under the OLD mode — drop them so the
+  // next advance re-fetches in the mode that's actually active now.
+  for (const k of Object.keys(_prewarm)) delete _prewarm[k];
+
+  if (!state.currentVideo || !state.currentVideo.id) return;
+  const t = player.currentTime || 0;
+  const wasPaused = player.paused;
+  const q = (state.currentQuality && state.currentQuality !== 'auto') ? state.currentQuality : 'best';
+  setPlayerStatus('LOADING', true);
+  fetch(`/video/${state.currentVideo.id}?quality=${encodeURIComponent(q)}&fresh=1${state.audioOnly ? '&audio_only=1' : ''}`)
+    .then(r => r.json())
+    .then(data => {
+      if (!data || !data.video_url) { setPlayerStatus('this vid is NOT going to load <3', true, true); return; }
+      state.currentVideo = { ...state.currentVideo, ...data };
+      state._proxyUrl = data.video_url;
+      state._directUrl = data.video_url_direct || data.video_url;
+      _applyAudioOnlyVisual(data, state.currentVideo.thumbnail);
+      setupPlayback(data);
+      player.addEventListener('loadedmetadata', () => {
+        try { player.currentTime = t; } catch {}
+        applyPlaybackRate();
+        if (!wasPaused) player.play().catch(()=>{});
+        setPlayerStatus('', false);
+      }, { once: true });
+    })
+    .catch(() => setPlayerStatus('this vid is NOT going to load <3', true, true));
+}
 
 function setupPlayback(data) {
   stopSplitAudio();
@@ -3405,7 +3514,7 @@ function refetchProgressive() {
   const wasPaused = player.paused;
   setPlayerStatus('LOADING', true);
   const q = (state.currentQuality && state.currentQuality !== 'auto') ? state.currentQuality : 'best';
-  fetch(`/video/${state.currentVideo.id}?quality=${encodeURIComponent(q)}&fresh=1`).then(r=>r.json()).then(data => {
+  fetch(`/video/${state.currentVideo.id}?quality=${encodeURIComponent(q)}&fresh=1${state.audioOnly ? '&audio_only=1' : ''}`).then(r=>r.json()).then(data => {
     if (!data || !data.video_url) { setPlayerStatus('this vid is NOT going to load <3', true, true); return; }
     state._proxyUrl = data.video_url;
     state._directUrl = data.video_url_direct || data.video_url;
@@ -3428,7 +3537,7 @@ function refetchFresh() {
   const wasPaused = player.paused;
   const q = (state.currentQuality && state.currentQuality !== 'auto') ? state.currentQuality : 'best';
   setPlayerStatus('REFRESHING', true);
-  fetch(`/video/${state.currentVideo.id}?quality=${encodeURIComponent(q)}&fresh=1`).then(r=>r.json()).then(data => {
+  fetch(`/video/${state.currentVideo.id}?quality=${encodeURIComponent(q)}&fresh=1${state.audioOnly ? '&audio_only=1' : ''}`).then(r=>r.json()).then(data => {
     if (!data || (!data.video_url && !data.audio_url)) { setPlayerStatus('this vid is NOT going to load <3', true, true); return; }
     state._proxyUrl = data.video_url;
     state._directUrl = data.video_url_direct || data.video_url;
@@ -3691,7 +3800,7 @@ function changeQuality(val) {
   const t = player.currentTime;
   state.currentQuality = val;
   setPlayerStatus('LOADING', true);
-  fetch(`/video/${v.id}?quality=${val}`).then(r => r.json()).then(data => {
+  fetch(`/video/${v.id}?quality=${val}${state.audioOnly ? '&audio_only=1' : ''}`).then(r => r.json()).then(data => {
     if (!data.video_url) { setPlayerStatus('', false); return; }
     const wasPaused = player.paused;
     state._proxyUrl = data.video_url;
@@ -5110,7 +5219,8 @@ function _safeDlName(s, ext) {
 function _triggerDownload(videoId, kind, title) {
   const ext = (kind === 'audio') ? 'm4a' : 'mp4';
   const a = document.createElement('a');
-  a.href = '/download?video_id=' + encodeURIComponent(videoId) + '&kind=' + kind;
+  a.href = '/download?video_id=' + encodeURIComponent(videoId) + '&kind=' + kind
+         + '&name=' + encodeURIComponent(title || '');
   a.download = _safeDlName(title, ext);   // browser hint; server's Content-Disposition is authoritative
   a.rel = 'noopener';
   document.body.appendChild(a);
@@ -5202,6 +5312,10 @@ function updateMediaSession(title, channel, thumbnail) {
 
 try { refreshAuth(); } catch (e) { console.error(e); }
 try { refreshLikedCache(); } catch (e) { console.error(e); }
+try {
+  const aoBtn = document.getElementById('vc-audioonly-btn');
+  if (aoBtn) aoBtn.classList.toggle('active', !!state.audioOnly);
+} catch (e) {}
 // Restore where the user was on reload, instead of always dumping them on Home.
 (function restoreSession(){
   let lastVideo = null;

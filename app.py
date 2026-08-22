@@ -641,7 +641,8 @@ _VALID_ID = _re.compile(r'^[A-Za-z0-9_-]{11}$')
 
 
 @app.get("/video/{video_id}")
-def get_video(video_id: str, quality: str = Query("best"), nohls: int = Query(0), nosplit: int = Query(0), fresh: int = Query(0)):
+def get_video(video_id: str, quality: str = Query("best"), nohls: int = Query(0), nosplit: int = Query(0),
+               fresh: int = Query(0), audio_only: int = Query(0)):
     # Reject malformed IDs immediately. A bad id (e.g. "#", truncated) otherwise sends
     # yt-dlp into a multi-client retry storm that floods logs and hammers the device.
     if not _VALID_ID.match(video_id or ""):
@@ -657,9 +658,10 @@ def get_video(video_id: str, quality: str = Query("best"), nohls: int = Query(0)
     # (muxed) stream, never split" so that fallback path plays with audio instead of a
     # silent/black video-only stream.
     single_element = bool(nosplit or nohls)
+    want_audio_only = bool(audio_only)
 
     # Short per-(video,quality) response cache so repeated opens are instant.
-    resp_key = f"video::{video_id}::{quality}::{int(single_element)}"
+    resp_key = f"video::{video_id}::{quality}::{int(single_element)}::{int(want_audio_only)}"
     cached = cache_get(resp_key)
     if cached:
         return cached
@@ -717,32 +719,46 @@ def get_video(video_id: str, quality: str = Query("best"), nohls: int = Query(0)
     video_url = None
     audio_url = None
     is_split = False
+    is_audio_only = False
+
+    # AUDIO-ONLY MODE: point the <video> element straight at an audio-only DASH track.
+    # A <video> tag plays an audio-only file fine (sound only, no frame) — so this reuses
+    # every existing control/sync/lock-screen code path untouched, while fetching NONE of
+    # the video bytes. If no audio-only track exists for this video, we silently fall
+    # through to normal video playback below rather than failing the request.
+    if want_audio_only:
+        au = best_audio()
+        if au and au.get("url"):
+            video_url = au["url"]
+            is_audio_only = True
+
 
     # RELIABILITY FIRST (blocked residential IPs):
     # Progressive/muxed streams (especially android 360p) often work when DASH
     # 720/1080 tracks return 403. Prefer progressive for normal playback so
     # videos actually play. Split is only used when no progressive exists.
-    if single_element:
-        p = best_progressive(target_h) or best_progressive()
-        if p:
-            video_url = p.get("url")
-        elif info.get("url"):
-            video_url = info.get("url")
-    else:
-        p = best_progressive(target_h) or best_progressive()
-        if p:
-            video_url = p.get("url")
-        else:
-            vo = best_video_only(target_h) if target_h else None
-            if not vo and heights:
-                vo = best_video_only(heights[0])
-            au = best_audio()
-            if vo and au:
-                video_url = vo.get("url")
-                audio_url = au.get("url")
-                is_split = True
+    if not video_url:
+        if single_element:
+            p = best_progressive(target_h) or best_progressive()
+            if p:
+                video_url = p.get("url")
             elif info.get("url"):
                 video_url = info.get("url")
+        else:
+            p = best_progressive(target_h) or best_progressive()
+            if p:
+                video_url = p.get("url")
+            else:
+                vo = best_video_only(target_h) if target_h else None
+                if not vo and heights:
+                    vo = best_video_only(heights[0])
+                au = best_audio()
+                if vo and au:
+                    video_url = vo.get("url")
+                    audio_url = au.get("url")
+                    is_split = True
+                elif info.get("url"):
+                    video_url = info.get("url")
 
     if not video_url:
         raise HTTPException(status_code=404, detail="No playable stream found")
@@ -762,6 +778,7 @@ def get_video(video_id: str, quality: str = Query("best"), nohls: int = Query(0)
         "video_url_direct": video_url,
         "audio_url": (f"{PUBLIC_BASE}/proxy?url={quote(audio_url, safe='')}" if audio_url else None),
         "is_split": is_split,
+        "is_audio_only": is_audio_only,
         "is_hls": False,
         "thumbnail": thumbnail,
         "channel": channel,
@@ -895,47 +912,56 @@ def _safe_filename(name, ext):
     return f"{name}.{ext}"
 
 @app.get("/download")
-def download(video_id: str = Query(...), kind: str = Query("video"), request: Request = None):
-    """Stream a downloadable file as an attachment. kind=video → progressive MP4 (has
-    audio; 360p is preferred because it's by far the most reliable muxed stream from a
-    blocked/residential IP — higher progressive tracks 403 the same way streaming did
-    before it was capped). kind=audio → best m4a audio (for music).
+async def download(video_id: str = Query(...), kind: str = Query("video"),
+                   url: str = Query(""), name: str = Query(""), request: Request = None):
+    """Download whatever the user is currently watching, as a file.
 
-    Reliability is matched to /proxy: we build an ORDERED candidate list, pass the
-    client's Range header through, and retry each candidate on 403/5xx before falling
-    back to the next one. Without this the Android download manager's first request
-    would hit a single 403 and report 'download failed'."""
+    The reliable path (used by the frontend) is to pass `url=` — the SAME direct stream
+    URL the player is already playing — plus an optional `name=`. We then relay it with
+    the exact async + retry mechanism /proxy uses (which works on this host), only adding
+    a Content-Disposition so the browser saves it instead of playing it. This means: if
+    it streams, it downloads. No format re-picking, no separate sync client (that sync
+    path was what made downloads fail even when streaming worked).
+
+    If `url=` is omitted we fall back to extracting a format server-side (kind=audio →
+    best m4a, else best progressive), so old links / direct hits still work.
+    """
     if not _VALID_ID.match(video_id or ""):
         raise HTTPException(status_code=400, detail="bad id")
-    info = _raw_extract(video_id)
-    title = info.get("title") or video_id
-    fmts = info.get("formats") or []
 
-    def _direct(f):
-        return f.get("url") and "m3u8" not in (f.get("protocol") or "")
+    src_url = url or ""
+    # Only accept googlevideo stream URLs for the pass-through path (don't become an open proxy).
+    if src_url and "googlevideo.com" not in src_url:
+        src_url = ""
 
-    if kind == "audio":
-        cands = [f for f in fmts
-                 if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none") and _direct(f)]
-        # Highest-bitrate m4a/mp4 audio first.
-        cands.sort(key=lambda f: (0 if f.get("ext") in ("m4a", "mp4") else 1, -(f.get("abr") or 0)))
-        ext = "m4a"
-    else:
-        cands = [f for f in fmts
-                 if f.get("acodec") not in (None, "none") and f.get("vcodec") not in (None, "none") and _direct(f)]
-        # mp4 first, then the height CLOSEST to 360 (most reliable muxed), then lower
-        # heights before higher ones. 360p progressive almost always streams; 720p
-        # muxed frequently 403s from a blocked IP.
-        cands.sort(key=lambda f: (0 if f.get("ext") == "mp4" else 1,
-                                  abs((f.get("height") or 0) - 360),
-                                  f.get("height") or 0))
-        ext = "mp4"
+    # Decide filename + extension.
+    ext = "m4a" if kind == "audio" else "mp4"
+    title = name or video_id
 
-    if not cands:
-        raise HTTPException(status_code=404, detail="no downloadable format available")
+    # Fallback: no url given → pick a format ourselves (kept for compatibility).
+    if not src_url:
+        info = _raw_extract(video_id)
+        title = name or info.get("title") or video_id
+        fmts = info.get("formats") or []
+        def _direct(f):
+            return f.get("url") and "m3u8" not in (f.get("protocol") or "")
+        if kind == "audio":
+            cands = [f for f in fmts if f.get("acodec") not in (None, "none")
+                     and f.get("vcodec") in (None, "none") and _direct(f)]
+            cands.sort(key=lambda f: (0 if f.get("ext") in ("m4a", "mp4") else 1, -(f.get("abr") or 0)))
+            ext = "m4a"
+        else:
+            cands = [f for f in fmts if f.get("acodec") not in (None, "none")
+                     and f.get("vcodec") not in (None, "none") and _direct(f)]
+            cands.sort(key=lambda f: (0 if f.get("ext") == "mp4" else 1,
+                                      abs((f.get("height") or 0) - 360), f.get("height") or 0))
+            ext = "mp4"
+        if not cands:
+            raise HTTPException(status_code=404, detail="no downloadable format available")
+        src_url = cands[0]["url"]
 
     filename = _safe_filename(title, ext)
-    base_headers = {
+    headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "Referer": "https://www.youtube.com/",
         "Origin": "https://www.youtube.com",
@@ -943,56 +969,37 @@ def download(video_id: str = Query(...), kind: str = Query("video"), request: Re
         "Accept-Language": "en-US,en;q=0.9",
         "Connection": "keep-alive",
     }
+    # Honour a Range header if the download manager sends one (enables resume/progress).
     range_header = request.headers.get("range") if request else None
+    if range_header:
+        headers["Range"] = range_header
 
-    client = httpx.Client(follow_redirects=True, timeout=httpx.Timeout(None, connect=15.0))
-
-    # Try each candidate format; retry transient 403/5xx a couple of times per format
-    # (fresh googlevideo URLs sometimes reject the first hit), then fall to the next.
+    # SAME async + retry path as /proxy (this is the mechanism that actually works here).
+    client = httpx.AsyncClient(follow_redirects=True, timeout=httpx.Timeout(None, connect=15.0))
     upstream = None
-    for f in cands[:5]:
-        src = f.get("url")
-        if not src:
+    for attempt in range(4):
+        req = client.build_request("GET", src_url, headers=headers)
+        upstream = await client.send(req, stream=True)
+        if upstream.status_code in (403, 500, 502, 503, 504) and attempt < 3:
+            await upstream.aclose()
             continue
-        for attempt in range(3):
-            hdrs = dict(base_headers)
-            if range_header:
-                hdrs["Range"] = range_header
-            try:
-                req = client.build_request("GET", src, headers=hdrs)
-                up = client.send(req, stream=True)
-            except Exception:
-                up = None
-                break  # connection failed → try next candidate
-            if up.status_code in (403, 500, 502, 503, 504) and attempt < 2:
-                up.close()
-                continue
-            if up.status_code >= 400:
-                up.close()
-                up = None
-                break  # non-transient error → try next candidate
-            upstream = up
-            break
+        break
+
+    if upstream is None or upstream.status_code >= 400:
+        code = upstream.status_code if upstream is not None else 502
         if upstream is not None:
-            break
+            await upstream.aclose()
+        await client.aclose()
+        raise HTTPException(status_code=502, detail=f"download upstream failed ({code})")
 
-    if upstream is None:
-        try: client.close()
-        except Exception: pass
-        raise HTTPException(status_code=502, detail="all download sources failed (upstream 403)")
-
-    def body():
+    async def body():
         try:
-            for chunk in upstream.iter_raw(chunk_size=262144):
+            async for chunk in upstream.aiter_raw(chunk_size=262144):
                 yield chunk
         finally:
-            try: upstream.close()
-            except Exception: pass
-            try: client.close()
-            except Exception: pass
+            await upstream.aclose()
+            await client.aclose()
 
-    # RFC 5987 + ASCII fallback so unicode titles (emoji, accents) survive the
-    # Content-Disposition header. Browsers prefer filename* over filename.
     ascii_fallback = _re.sub(r'[^\x20-\x7e]', '_', filename) or f"rippl.{ext}"
     quoted_utf8 = quote(filename, safe="")
     out_headers = {
@@ -1000,15 +1007,14 @@ def download(video_id: str = Query(...), kind: str = Query("video"), request: Re
         "Cache-Control": "no-store",
         "Accept-Ranges": "bytes",
     }
-    # Pass length/range through so the download manager can show progress and resume.
     if "content-length" in upstream.headers:
         out_headers["Content-Length"] = upstream.headers["content-length"]
     if "content-range" in upstream.headers:
         out_headers["Content-Range"] = upstream.headers["content-range"]
     media_type = upstream.headers.get("content-type") or ("audio/mp4" if ext == "m4a" else "video/mp4")
-    # Preserve 206 for ranged requests, 200 otherwise.
     status_code = upstream.status_code if upstream.status_code in (200, 206) else 200
     return StreamingResponse(body(), status_code=status_code, media_type=media_type, headers=out_headers)
+
 
 
 @app.get("/proxy")
