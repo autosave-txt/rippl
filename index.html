@@ -3700,6 +3700,7 @@ async function loadRelatedVideos(videoId) {
   } catch {}
 }
 
+const _LOAD_FAILED_MSG = "this vid is NOT going to load <3";
 function setPlayerStatus(msg, visible, permanent) {
   const el = document.getElementById('player-status');
   const txt = document.getElementById('player-status-text');
@@ -3707,6 +3708,22 @@ function setPlayerStatus(msg, visible, permanent) {
   txt.textContent = msg;
   el.classList.toggle('visible', visible);
   if (dots) dots.style.display = (permanent || !visible) ? 'none' : 'inline-flex';
+  // Give the load-failed message a one-tap retry instead of leaving the user stuck —
+  // forces a brand-new extraction (bypassing any cached/expired stream URL), which is
+  // exactly what re-queuing + hitting Next was being used as a workaround for.
+  if (msg === _LOAD_FAILED_MSG && visible) {
+    txt.textContent = msg + '  ↻ TAP TO RETRY';
+    el.style.cursor = 'pointer';
+    el.style.pointerEvents = 'all';
+    el.onclick = () => {
+      el.onclick = null; el.style.pointerEvents = 'none'; el.style.cursor = '';
+      refetchFresh();
+    };
+  } else {
+    el.style.cursor = '';
+    el.style.pointerEvents = 'none';
+    el.onclick = null;
+  }
 }
 
 function openChannelSearch() {
@@ -4946,7 +4963,7 @@ async function refreshAuth() {
   const prevUser = state.user;
   try { const r = await fetch('/auth/me'); const d = await r.json(); state.user = d.username || null; state.avatar = d.avatar || null; }
   catch { state.user = null; state.avatar = null; }
-  if (state.user !== prevUser) { try { _loadChat(); _loadSearchLog(); } catch {} }
+  if (state.user !== prevUser) { try { _loadSearchLog(); } catch {} }
   renderAuthUI();
   renderNavProfile();
   if (document.getElementById('view-profile').classList.contains('active')) renderProfile();
@@ -5016,7 +5033,6 @@ async function _authSubmit(url) {
     if (d.token) window.ripplSetToken(d.token);   // header auth, works cross-origin
     state.user = d.username;
     state.avatar = d.avatar || null;
-    _loadChat();   // switch to this user's per-account chat history
     _loadSearchLog();
     renderAuthUI();
     renderNavProfile();
@@ -5037,7 +5053,6 @@ async function doLogout() {
   window.ripplSetToken('');
   state.user = null;
   state.avatar = null;
-  _loadChat();   // back to the anon chat history
   _loadSearchLog();
   state.likedIds = new Set(); state.likesCache = []; state._feedCache = {};
   renderAuthUI();
